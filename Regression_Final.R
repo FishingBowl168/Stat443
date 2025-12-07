@@ -527,14 +527,14 @@ newdata_bc <- data.frame(
 )
 
 # Forecast with 95% prediction intervals
-fc_bc <- predict(Best_model_1_bc, newdata = newdata_bc, interval = "prediction", level = 0.95)
+fc_bc <- predict(Best_model_2, newdata = newdata_bc, interval = "prediction", level = 0.95)
 
 # ---- Plot forecast (fitted history + future with PI) ----
 op <- par(mar = c(4,4,2,1))
 # history on original scale y vs t_aln
 plot(t_aln, df2$y, type = "l", xlab = "Time", ylab = "y", main = "Forecast to 2026 with 95% PI")
 # fitted line over history (optional but nice)
-lines(t_aln, fitted(Best_model_1_bc), col = "blue")
+lines(t_aln, fitted(Best_model_2), col = "blue")
 
 # future forecast & intervals
 lines(t_future, fc_bc[, "fit"], lwd = 2,  col = "red")
