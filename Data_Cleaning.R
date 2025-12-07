@@ -46,7 +46,6 @@ Energy_monthly<- Energy_daily %>%
   )
 
 #Check for abnormal values/outliers 
-
 numeric_columns = c("demand_monthly_avg", "price_monthly_avg")
 plot_hist_with_npdf = function(x, col_name) {
   h_for_ylim = hist(Energy_monthly[[col_name]], plot = FALSE)   # new: get counts for ylim
@@ -73,6 +72,7 @@ for (col in numeric_columns) {
 }
 par(mfrow = c(1, 1))
 
+#Get the time series 
 start_y <- lubridate::year(min(Energy_monthly$month))
 start_m <- lubridate::month(min(Energy_monthly$month))
 
