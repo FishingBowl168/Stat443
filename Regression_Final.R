@@ -257,9 +257,9 @@ summary(best_BIC)
 RegressionDiagnosicsPlots(best_AIC)
 RegressionDiagnosicsTests(best_AIC)
 
-Best_model_1_bc <- lm(y ~ t1 + t2  + t6 +d_aln, data =df2)
-RegressionDiagnosicsPlots(Best_model_1_bc)
-RegressionDiagnosicsTests(Best_model_1_bc)
+Best_model_2 <- lm(y ~ t1 + t2  + t6 +d_aln, data =df2)
+RegressionDiagnosicsPlots(Best_model_2)
+RegressionDiagnosicsTests(Best_model_2)
 
 ## =======================
 ## Elastic Net
@@ -462,7 +462,7 @@ evaluate_model <- function(model, df_used, t0_vec, P_basis = NULL, kfold = 5, se
 P_basis <- poly(t_aln, 6, raw = FALSE)
 
 res_best <- evaluate_model(
-  model   = Best_model_1_bc,
+  model   = Best_model_2,
   df_used = df2,
   t0_vec  = t0_vec,
   P_basis = P_basis
@@ -478,7 +478,7 @@ res_lm1se <- evaluate_model(
 
 
 comp <- data.frame(
-  Model = c("Best_model_1_bc", "ENet_1SE_refit"),
+  Model = c("Best_model_2", "ENet_1SE_refit"),
   Pred.SE.2014 = c(res_best$Pred.SE[1],  res_lm1se$Pred.SE[1]),
   Pred.SE.2018 = c(res_best$Pred.SE[2],  res_lm1se$Pred.SE[2]),
   AdjR2        = c(res_best$AdjR2,       res_lm1se$AdjR2),
