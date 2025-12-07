@@ -125,7 +125,7 @@ output <- data.frame(t = NA, Pred.SE.2014 = NA, Pred.SE.2018 = NA,
 ## Model selection
 for (p in 1:6) {
   model <- lm(y ~ poly(t_aln, p) + d_aln +
-                sin(2*pi*t_aln/6) + cos(2*pi*t_aln/6),
+                sin(4*pi*t_aln) + cos(4*pi*t_aln),
               data = df)
   
   ## Prediction SE at t0 (supply t_aln & d_aln; sin/cos are computed from t_aln)
@@ -167,7 +167,7 @@ d_tr <- df$d_aln[-pred.indx]
 APSE <- numeric(6)
 for (p in 1:6) {
   model <- lm(y_tr ~ poly(t_tr, p) + d_tr +
-                sin(2*pi*t_tr/6) + cos(2*pi*t_tr/6))
+                sin(4*pi*t_tr) + cos(4*pi*t_tr))
   
   pred <- predict(model, newdata = data.frame(
     t_tr = df$t_aln[pred.indx],
@@ -206,7 +206,7 @@ for (k in 1:number.of.folds) {
   
   for (i in 1:6) {
     fitmod <- lm(yy ~ poly(x, i) + z +
-                   sin(2*pi*x/6) + cos(2*pi*x/6))
+                   sin(4*pi*x) + cos(4*pi*x))
     
     Pred <- predict(fitmod, newdata = data.frame(
       x = t.shuf[Folds[[k]]],
@@ -228,7 +228,7 @@ round(data.frame(output, APSE, CV.Err = CV.Err), 4)
 
 ## Final best model example
 Best_model_1 <- lm(y ~ poly(t_aln, 3) + d_aln +
-                     sin(2*pi*t_aln/6) + cos(2*pi*t_aln/6),
+                     sin(4*pi*t_aln) + cos(4*pi*t_aln),
                    data = df)
 RegressionDiagnosicsPlots(Best_model_1)
 RegressionDiagnosicsTests(Best_model_1)
@@ -240,7 +240,7 @@ df <- as.data.frame(df)
 
 bc <- boxcox(
   y ~ poly(t_aln, 3) + d_aln +
-    sin(2*pi*t_aln/6) + cos(2*pi*t_aln/6),
+    sin(4*pi*t_aln) + cos(4*pi*t_aln),
   data   = df,
   lambda = seq(-2, 2, 0.1),
   plotit = TRUE
@@ -251,7 +251,7 @@ opt.lambda = bc$x[which.max(bc$y)]
 
 y_bc1 <- (y^opt.lambda - 1) / opt.lambda
 Best_model_1_bc <- lm(y_bc1 ~ poly(t_aln, 3) + d_aln +
-                     sin(2*pi*t_aln/6) + cos(2*pi*t_aln/6),
+                     sin(4*pi*t_aln) + cos(4*pi*t_aln),
                    data = df)
 RegressionDiagnosicsPlots(Best_model_1_bc)
 RegressionDiagnosicsTests(Best_model_1_bc)
@@ -273,8 +273,8 @@ df2 <- data.frame(
 df2 <- cbind(df2, X.ortho.df)
 
 ## precompute seasonal harmonics (period = 6 here)
-df2$sin6 <- sin(2*pi*df2$t_aln/6)
-df2$cos6 <- cos(2*pi*df2$t_aln/6)
+df2$sin6 <- sin(4*pi*df2$t_aln)
+df2$cos6 <- cos(4*pi*df2$t_aln)
 
 
 model2 <- lm(y ~ t1 + t2 + t3 + t4 + t5 + t6 + d_aln + sin6 + cos6, data = df2)
@@ -286,7 +286,7 @@ n <- nrow(df2)
 best_BIC <- step(model2, k = log(n), direction = "both")
 summary(best_BIC)
 
-Best_model_2 <- lm(y ~ t1 + t2 + t3 + t5 + d_aln + sin6 + cos6, data = df2)
+Best_model_2 <- lm(y ~ t1 + t2 + t3 + d_aln + cos6, data = df2)
 RegressionDiagnosicsPlots(Best_model_2)
 RegressionDiagnosicsTests(Best_model_2)
 
@@ -311,8 +311,8 @@ X.ortho.df <- as.data.frame(P_basis)
 names(X.ortho.df) <- paste0("t", 1:6)
 
 # seasonal harmonics from t_aln 
-sin6 <- sin(2*pi*as.numeric(t_aln)/6)
-cos6 <- cos(2*pi*as.numeric(t_aln)/6)
+sin6 <- sin(4*pi*as.numeric(t_aln))
+cos6 <- cos(4*pi*as.numeric(t_aln))
 
 # master df
 D <- data.frame(
@@ -328,9 +328,16 @@ D <- data.frame(
 D <- na.omit(D)
 
 # Elastic Net 
+# predictors 
 predictor_cols <- c(paste0("t", 1:6), "d_aln", "sin6", "cos6")
 X <- as.matrix(D[, predictor_cols, drop = FALSE])
 Y <- D$y
+
+# force-keep seasonal harmonics in glmnet
+forced_terms <- c("sin6", "cos6")
+pf <- rep(1, length(predictor_cols))
+pf[match(forced_terms, predictor_cols)] <- 0
+
 
 set.seed(123)
 alphas <- c(0, 0.25, 0.5, 0.75, 1)
@@ -353,7 +360,8 @@ for (i in seq_along(alphas)) {
     alpha = a,
     nfolds = 10,
     standardize = TRUE,
-    intercept = TRUE
+    intercept = TRUE,
+#    penalty.factor = pf       # <--- NEW
   )
   cv_list[[as.character(a)]] <- cvfit
   
@@ -377,8 +385,14 @@ cat("Best by lambda.1se:  alpha =", best_alpha_1se, " lambda =", best_lambda_1se
 
 
 beta_1se <- as.matrix(coef(best_cv_1se, s = "lambda.1se"))
-active_idx  <- which(beta_1se[-1, , drop = FALSE] != 0)   # drop intercept row
-active_vars <- rownames(beta_1se)[-1][active_idx]
+
+# drop intercept row
+nz_idx <- which(beta_1se[-1, , drop = FALSE] != 0)
+vars_from_coeffs <- rownames(beta_1se)[-1][nz_idx]
+
+# ensure forced terms are kept even if numerically tiny
+active_vars <- union(vars_from_coeffs, forced_terms)
+
 
 # Refit OLS on selected vars 
 Best_model_3 <- lm(reformulate(active_vars, response = "y"), data = D)
@@ -429,8 +443,8 @@ RegressionDiagnosicsTests(Best_model_3_bc)
   }
   
   ## seasonal columns (period = 6)
-  if ("sin6" %in% all_needed) nd$sin6 <- sin(2*pi*t0_vec/6)
-  if ("cos6" %in% all_needed) nd$cos6 <- cos(2*pi*t0_vec/6)
+  if ("sin6" %in% all_needed) nd$sin6 <- sin(4*pi*t0_vec)
+  if ("cos6" %in% all_needed) nd$cos6 <- cos(4*pi*t0_vec)
   
   skip <- c("(Intercept)", "y", "y_bc2", "t_aln", "d_aln", "month", tcols_all, "sin6", "cos6")
   other_needed <- setdiff(all_needed, skip)
@@ -542,8 +556,9 @@ colnames(P_fut) <- paste0("t", 1:ncol(P_fut))
 
 # FUTURE d_aln scenario = mean training d_aln
 mf <- model.frame(Best_model_3_bc)
-d_mean <-  mean(mf$d_aln, na.rm = TRUE) 
-d_future <- rep(d_mean, length(t_future))
+fit_d <- lm(d_aln ~ sin(4*pi*t_aln) + cos(4*pi*t_aln), data = D)
+d_future <- predict(fit_d, newdata = data.frame(t_aln = t_future))
+
 
 # Assemble NEWDATA matching the exact terms the model uses
 need       <- attr(terms(Best_model_3_bc), "term.labels")
@@ -552,6 +567,8 @@ tcols_used <- intersect(paste0("t", 1:6), need)
 newdata_bc <- data.frame(row = seq_along(t_future))
 if (length(tcols_used) > 0) newdata_bc <- cbind(newdata_bc, P_fut[, tcols_used, drop = FALSE])
 if ("d_aln" %in% need) newdata_bc$d_aln <- d_future
+if ("sin6" %in% need) newdata_bc$sin6 <- sin(4*pi*as.numeric(t_future))
+if ("cos6" %in% need) newdata_bc$cos6 <- cos(4*pi*as.numeric(t_future))
 newdata_bc$row <- NULL
 
 # Sanity checks
