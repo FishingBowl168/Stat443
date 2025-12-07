@@ -90,7 +90,7 @@ opt.lambda = boxcox.model$x[which.max(boxcox.model$y)]
 
 Energy_monthly$price_monthly_avg_bc <- (Energy_monthly$price_monthly_avg^opt.lambda - 1) / opt.lambda
 
-model <- lm(Energy_monthly$price_monthly_avg ~ 1, data =Energy_monthly)
+model <- lm(Energy_monthly$price_monthly_avg_bc ~ 1, data =Energy_monthly)
 boxcox.model = MASS::boxcox(model, lambda = seq(-2, 2, 0.1), plotit = TRUE)
 opt.lambda = boxcox.model$x[which.max(boxcox.model$y)]
 

@@ -68,7 +68,7 @@ RegressionDiagnosicsTests <- function(
   print(randtests::runs.test(residuals.model, plot = TRUE))
 }
 
-# Fitting a linear regression model with time and month as explanatory variates
+# Fitting a linear regression model with time
 tim <- time(price_ts) # Extracting time as the explanatory variate from the time series framework of data
 model <- lm(price_ts ~ tim + Energy_monthly$demand_monthly_avg)
 RegressionDiagnosicsPlots(model)
@@ -96,23 +96,14 @@ par(mfrow=c(1,2))
 
 #difference
 diff_price2 <- diff(Energy_monthly$price_monthly_avg_b, lag=12)
-acf(diff_price2, lag.max = 36)
 
 # number of seasonal lags lost
 n_lost <- 12
 
-
+#Create a data Frame for regression
 t_aln = tim[(n_lost + 1):length(tim)]
 d_aln = Energy_monthly$demand_monthly_avg[(n_lost + 1):length(Energy_monthly$demand_monthly_avg)]
 y = diff_price2
-
-
-
-#Create a data Frame for regression
-#t_aln <- tim
-#d_aln <- Energy_monthly$demand_monthly_avg
-#y <- Energy_monthly$price_monthly_avg_bc
-
 df <- data.frame(y, t_aln, d_aln)
 
 
@@ -145,9 +136,9 @@ for (p in 1:6) {
   )
   
   ## Convert 95% PI width to Pred.SE: width = 2 * t_{.975,df} * SE_pred
-  df_eff <- length(y) - (p + 2)  # p poly terms + intercept? (poly adds p columns) + d_aln
+  df_eff <- length(y) - (p + 2)  
   tcrit  <- qt(0.975, df = max(df_eff, 1))
-  pred_se <- (Pred[, "upr"] - Pred[, "lwr"]) / (2 * tcrit)  # length 2 (500, 750)
+  pred_se <- (Pred[, "upr"] - Pred[, "lwr"]) / (2 * tcrit)  
   
   output[p, ] <- c(
     p,
@@ -240,7 +231,7 @@ X.ortho<-poly(t_aln, 6, raw = FALSE)
 X.ortho.df <- as.data.frame(X.ortho)
 colnames(X.ortho.df) <- c("t1","t2","t3","t4","t5","t6")
 
-y=df$y
+
 df2 <- cbind( X.ortho.df, y, d_aln)
 
 model2 <- lm(y ~ t1 + t2 + t3 + t4 + t5 + t6 +d_aln, data =df2)
@@ -266,14 +257,9 @@ RegressionDiagnosicsTests(Best_model_2)
 ## =======================
 library(glmnet) # calling the glmnet library
 
-length(df$y)
-length(df$t_aln)
+
 # --- Build the design matrix from your objects y, t_aln, d_aln ---
 stopifnot(length(y) == length(t_aln), length(y) == length(d_aln))
-
-X.ortho <- poly(t_aln, 6, raw = FALSE)
-X.ortho.df <- as.data.frame(X.ortho)
-colnames(X.ortho.df) <- paste0("t", 1:6)
 
 df3 <- cbind(X.ortho.df, d_aln = as.numeric(d_aln))
 y_vec <- as.numeric(df$y)
@@ -303,14 +289,14 @@ for (i in seq_along(alphas)) {
     x = X, y = Y,
     family = "gaussian",
     alpha = a,
-    nfolds = 10,            # Since there is a high number of observations
+    nfolds = 10,            
     standardize = TRUE,
     intercept = TRUE        # include intercept; safer than forcing 0
   )
   cv_list[[as.character(a)]] <- cvfit
   
   # Extract metrics
-  summary_tbl$cvm_min[i]     <- min(cvfit$cvm)                 # at lambda.min
+  summary_tbl$cvm_min[i]     <- min(cvfit$cvm)                 
   summary_tbl$lambda_min[i]  <- cvfit$lambda.min
   summary_tbl$cvm_1se[i]     <- cvfit$cvm[cvfit$lambda == cvfit$lambda.1se]
   summary_tbl$lambda_1se[i]  <- cvfit$lambda.1se
@@ -324,7 +310,7 @@ for (i in seq_along(alphas)) {
 
 print(summary_tbl[order(summary_tbl$cvm_min), ], row.names = FALSE)
 
-# --- Choose a winner ---
+
 # pick by cvm_1se
 best_idx_1se <- which.min(summary_tbl$cvm_1se)
 best_alpha_1se <- summary_tbl$alpha[best_idx_1se]
@@ -332,24 +318,19 @@ best_lambda_1se <- summary_tbl$lambda_1se[best_idx_1se]
 
 cat("Best by lambda.1se:  alpha =", best_alpha_1se, " lambda =", best_lambda_1se, "\n\n")
 
-# If you prefer the 1SE rule (simpler model), use:
 best_cv_1se <- cv_list[[as.character(best_alpha_1se)]]
 beta_hat_1se <- coef(best_cv_1se, s = "lambda.1se")
 nz1 <- which(beta_hat_1se != 0)
 cat("\nNon-zero coefficients (lambda.1se):\n")
 print(beta_hat_1se[nz1, , drop = FALSE])
 
-# --- packages you use in the functions ---
-library(car)        # for qqPlot
-library(randtests)  # for runs.test
 
-# --- assume you have X (matrix or data.frame of predictors) and y (response) used in cv.glmnet ---
-# 1) Identify the active set from your 1SE solution
+# Identify the active set from your 1SE solution
 beta_1se <- as.matrix(coef(best_cv_1se, s = "lambda.1se"))
 active_idx <- which(beta_1se[-1, , drop = FALSE] != 0)          # drop intercept row
 active_vars <- rownames(beta_1se)[-1][active_idx]               # names of selected predictors
 
-# 2) Build a data.frame for lm and refit with the chosen variables
+# Build a data.frame for lm and refit with the chosen variables
 dat <- data.frame(y = y, X)
 fit_1se_lm <- lm(reformulate(active_vars, response = "y"), data = dat)
 
@@ -360,7 +341,7 @@ RegressionDiagnosicsTests(fit_1se_lm)
 #===========
 #Test best models to choose 1 
 #============
-## -------- NEW helper: build newdata rows that match a model's terms ----------
+## build new data rows that match a model's terms
 .make_newdata_for_t0 <- function(model, t0_vec, base_df, P_basis = NULL) {
   nd <- data.frame(row = seq_along(t0_vec))
   
@@ -387,30 +368,17 @@ RegressionDiagnosicsTests(fit_1se_lm)
     nd$t_aln <- t0_vec
   }
   
-  # Provide d_aln if requested (use mean as a neutral value)
+  # Provide d_aln if requested 
   if ("d_aln" %in% all_needed) {
-    nd$d_aln <- mean(base_df$d_aln, na.rm = TRUE)
+    # direct match if t0 values appear in your data
+    nd$d_aln <- with(base_df, d_aln[match(t0_vec, t_aln)])
+    
   }
   
-  # Provide month if present (reference level)
-  if ("month" %in% all_needed && "month" %in% names(base_df)) {
-    nd$month <- factor(rep(levels(base_df$month)[1], length(t0_vec)),
-                       levels = levels(base_df$month))
-  }
   
-  # Any other columns that appear in the model: pull from base_df as neutral values
-  # - numeric → mean; factor → reference level; dummy (0/1) → column mean (works fine)
+  # Any other columns that appear in the model
   skip <- c("(Intercept)", "y", "t_aln", "d_aln", "month", tcols_all)
   other_needed <- setdiff(all_needed, skip)
-  for (v in other_needed) {
-    if (!v %in% names(base_df)) next
-    if (is.factor(base_df[[v]])) {
-      nd[[v]] <- factor(rep(levels(base_df[[v]])[1], length(t0_vec)),
-                        levels = levels(base_df[[v]]))
-    } else {
-      nd[[v]] <- mean(base_df[[v]], na.rm = TRUE)
-    }
-  }
   
   nd$row <- NULL
   nd
@@ -437,7 +405,7 @@ evaluate_model <- function(model, df_used, t0_vec, P_basis = NULL, kfold = 5, se
   pred_te <- predict(fit_tr, newdata = df_used[hold, , drop = FALSE])
   APSE <- mean((df_used$y[hold] - pred_te)^2, na.rm = TRUE)
   
-  # 4) k-fold CV error (refit same formula per fold)
+  # 4) k-fold CV error 
   set.seed(seed + 1)
   idx <- sample(seq_len(n), n, replace = FALSE)
   folds <- split(idx, cut(seq_along(idx), breaks = kfold, labels = FALSE))
@@ -458,7 +426,7 @@ evaluate_model <- function(model, df_used, t0_vec, P_basis = NULL, kfold = 5, se
 }
 
 
-# keep this
+
 P_basis <- poly(t_aln, 6, raw = FALSE)
 
 res_best <- evaluate_model(
@@ -468,12 +436,12 @@ res_best <- evaluate_model(
   P_basis = P_basis
 )
 
-# PASS P_basis HERE TOO (if fit_1se_lm uses any of t1..t6)
+
 res_lm1se <- evaluate_model(
   model   = fit_1se_lm,
   df_used = dat,
   t0_vec  = t0_vec,
-  P_basis = P_basis   # <-- was NULL before; provide the same basis
+  P_basis = P_basis   
 )
 
 
@@ -497,28 +465,25 @@ print(cbind(
 #==========
 #Forecast
 #==========
-## ---- Forecast to 2026 with 95% PI ----
 
-# 0) prerequisites we already have:
-#   P_basis, t_aln, d_aln, df2, Best_model_1_bc
+# prerequisites we already have:P_basis, t_aln, d_aln, df2, Best_model_2
 
-# Step size (monthly if your series is monthly)
-step <- if (exists("price_ts")) 1/frequency(price_ts) else median(diff(t_aln))
+# Step size
+step <- 1/frequency(price_ts) 
 
-# Build a monthly grid from the period AFTER your last observation up to Dec-2026
+# Build a monthly grid from the period AFTER the last observation up to Dec-2026
 last_t   <- max(t_aln)
-end_t    <- 2026 + 11/12   # 2026-Dec in decimal year
+end_t    <- 2026 + 11/12   
 t_future <- seq(from = last_t + step, to = end_t, by = step)
 
 # Create the orthogonal polynomial columns at future times
 P_fut <- as.data.frame(predict(P_basis, newdata = t_future))
 colnames(P_fut) <- paste0("t", 1:ncol(P_fut))
 
-# If you have your own future demand forecast, put it in d_future (same length as t_future)
-# d_future <- <your vector here>
-d_future <- rep(mean(d_aln, na.rm = TRUE), length(t_future))   # default: mean demand
 
-# Assemble the newdata for THIS model (only the columns it uses)
+d_future <- rep(mean(d_aln, na.rm = TRUE), length(t_future))
+
+# Assemble the newdata for THIS model
 newdata_bc <- data.frame(
   t1 = P_fut$t1,
   t2 = P_fut$t2,
@@ -529,11 +494,11 @@ newdata_bc <- data.frame(
 # Forecast with 95% prediction intervals
 fc_bc <- predict(Best_model_2, newdata = newdata_bc, interval = "prediction", level = 0.95)
 
-# ---- Plot forecast (fitted history + future with PI) ----
+# Plot forecast (fitted history + future with PI)
 op <- par(mar = c(4,4,2,1))
-# history on original scale y vs t_aln
+# original y vs t_aln
 plot(t_aln, df2$y, type = "l", xlab = "Time", ylab = "y", main = "Forecast to 2026 with 95% PI")
-# fitted line over history (optional but nice)
+# fitted line over history
 lines(t_aln, fitted(Best_model_2), col = "blue")
 
 # future forecast & intervals
@@ -545,9 +510,9 @@ legend("topleft", bty = "n",
        lty = c(1,1,1,2), col = c("black","blue","red","black"), lwd = c(1,1,2,1))
 par(op)
 
-# ---- Show and save forecast numbers ----
+# Show forecast numbers
 Forecast_tbl <- data.frame(
-  Time = round(t_future, 4),      # or format as year-month
+  Time = round(t_future, 4),     
   Predicted = fc_bc[, "fit"],
   Lower_95 = fc_bc[, "lwr"],
   Upper_95 = fc_bc[, "upr"]
