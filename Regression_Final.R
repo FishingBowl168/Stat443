@@ -253,6 +253,7 @@ y_bc1 <- (y^opt.lambda - 1) / opt.lambda
 Best_model_1_bc <- lm(y_bc1 ~ poly(t_aln, 3) + d_aln +
                      sin(4*pi*t_aln) + cos(4*pi*t_aln),
                    data = df)
+summary(Best_model_1_bc)
 RegressionDiagnosicsPlots(Best_model_1_bc)
 RegressionDiagnosicsTests(Best_model_1_bc)
 
@@ -296,7 +297,7 @@ opt.lambda <- bc$x[which.max(bc$y)]
 
 df2$y_bc2 <- if (abs(opt.lambda) < 1e-6) log(df2$y) else (df2$y^opt.lambda - 1)/opt.lambda
 
-Best_model_2_bc <- lm(y_bc2 ~ t1 + t2 + t3 + t5 + d_aln + sin6 + cos6, data = df2)
+Best_model_2_bc <- lm(y_bc2 ~ t1 + t2 + t3 + d_aln + cos6, data = df2)
 RegressionDiagnosicsPlots(Best_model_2_bc)
 RegressionDiagnosicsTests(Best_model_2_bc)
 
@@ -329,15 +330,11 @@ D <- na.omit(D)
 
 # Elastic Net 
 # predictors 
-predictor_cols <- c(paste0("t", 1:6), "d_aln", "sin6", "cos6")
+ predictor_cols <- c(paste0("t",1:6), "d_aln", "sin6", "cos6")
+
+
 X <- as.matrix(D[, predictor_cols, drop = FALSE])
 Y <- D$y
-
-# force-keep seasonal harmonics in glmnet
-forced_terms <- c("sin6", "cos6")
-pf <- rep(1, length(predictor_cols))
-pf[match(forced_terms, predictor_cols)] <- 0
-
 
 set.seed(123)
 alphas <- c(0, 0.25, 0.5, 0.75, 1)
@@ -360,8 +357,7 @@ for (i in seq_along(alphas)) {
     alpha = a,
     nfolds = 10,
     standardize = TRUE,
-    intercept = TRUE,
-#    penalty.factor = pf       # <--- NEW
+    intercept = TRUE
   )
   cv_list[[as.character(a)]] <- cvfit
   
@@ -378,21 +374,21 @@ for (i in seq_along(alphas)) {
 
 print(summary_tbl[order(summary_tbl$cvm_min), ], row.names = FALSE)
 
-best_idx_1se    <- which.min(summary_tbl$cvm_1se)
-best_alpha_1se  <- summary_tbl$alpha[best_idx_1se]
-best_cv_1se     <- cv_list[[as.character(best_alpha_1se)]]
-best_lambda_1se <- summary_tbl$lambda_1se[best_idx_1se] 
-cat("Best by lambda.1se:  alpha =", best_alpha_1se, " lambda =", best_lambda_1se, "\n\n")
+## choose by lambda.min instead of lambda.1se
+best_idx_min    <- which.min(summary_tbl$cvm_min)
+best_alpha_min  <- summary_tbl$alpha[best_idx_min]
+best_cv_min     <- cv_list[[as.character(best_alpha_min)]]
+best_lambda_min <- summary_tbl$lambda_min[best_idx_min]
+cat("Best by lambda.min:  alpha =", best_alpha_min, " lambda =", best_lambda_min, "\n\n")
 
+## coefficients at lambda.min
+beta_min <- as.matrix(coef(best_cv_min, s = "lambda.min"))
 
-beta_1se <- as.matrix(coef(best_cv_1se, s = "lambda.1se"))
+## drop intercept row -> active vars
+nz_idx <- which(beta_min[-1, , drop = FALSE] != 0)
+vars_from_coeffs <- rownames(beta_min)[-1][nz_idx]
+active_vars <- vars_from_coeffs
 
-# drop intercept row
-nz_idx <- which(beta_1se[-1, , drop = FALSE] != 0)
-vars_from_coeffs <- rownames(beta_1se)[-1][nz_idx]
-
-# ensure forced terms are kept even if numerically tiny
-active_vars <- union(vars_from_coeffs, forced_terms)
 
 
 # Refit OLS on selected vars 
@@ -417,24 +413,21 @@ RegressionDiagnosicsTests(Best_model_3_bc)
 .make_newdata_for_t0 <- function(model, t0_vec, base_df, P_basis = NULL) {
   nd <- data.frame(row = seq_along(t0_vec))
   
-  fml_terms <- attr(terms(model), "term.labels")
+  fml_terms  <- attr(terms(model), "term.labels")
   all_needed <- all.vars(formula(model))
   
-  tcols_all <- paste0("t", 1:6)
+  tcols_all  <- paste0("t", 1:6)
   tcols_used <- intersect(tcols_all, all_needed)
   
   if (length(tcols_used) > 0) {
-    if (is.null(P_basis)) {
-      stop("Model uses t1..t6 but P_basis is NULL. Pass P_basis = poly(t_aln, 6, raw = FALSE).")
-    }
+    if (is.null(P_basis)) stop("Model uses t1..t6 but P_basis is NULL.")
     X0 <- as.data.frame(predict(P_basis, newdata = t0_vec))
     colnames(X0) <- tcols_all[seq_len(ncol(X0))]
     nd <- cbind(nd, X0[, tcols_used, drop = FALSE])
   }
   
-  if ("t_aln" %in% names(base_df) && "t_aln" %in% all_needed) {
+  if ("t_aln" %in% names(base_df) && "t_aln" %in% all_needed)
     nd$t_aln <- t0_vec
-  }
   
   if ("d_aln" %in% all_needed) {
     m <- match(t0_vec, base_df$t_aln)
@@ -443,11 +436,12 @@ RegressionDiagnosicsTests(Best_model_3_bc)
     nd$d_aln <- d_at_t0
   }
   
-  ## seasonal columns (period = 6)
-  if ("sin6" %in% all_needed) nd$sin6 <- sin(4*pi*t0_vec)
-  if ("cos6" %in% all_needed) nd$cos6 <- cos(4*pi*t0_vec)
+  ## seasonal columns
+  if ("sin6" %in% all_needed) nd$sin6 <- sin(4*pi*as.numeric(t0_vec))
+  if ("cos6" %in% all_needed) nd$cos6 <- cos(4*pi*as.numeric(t0_vec))
   
-  skip <- c("(Intercept)", "y", "y_bc2", "t_aln", "d_aln", "month", tcols_all, "sin6", "cos6")
+  # fill any other needed terms with means/baselines
+  skip <- c("(Intercept)","y","y_bc2","t_aln","d_aln",tcols_all,"sin6","cos6") 
   other_needed <- setdiff(all_needed, skip)
   for (v in other_needed) {
     if (!v %in% names(base_df)) next
@@ -462,6 +456,7 @@ RegressionDiagnosicsTests(Best_model_3_bc)
   nd$row <- NULL
   nd
 }
+
 
 
 evaluate_model <- function(model, df_used, t0_vec, P_basis = NULL, kfold = 5, seed = 123) {
@@ -543,7 +538,7 @@ print(cbind(
 ))
 
 ## =========================
-## Forecast to Dec-2026 (+ PI) from Best_model_3_bc
+## Forecast to Dec-2026 (+ PI) from Best_model_2_bc
 ## =============================
 # Step size from your ts() frequency
 step   <- 1 / frequency(price_ts)
@@ -556,13 +551,13 @@ P_fut <- as.data.frame(predict(P_basis, newdata = t_future))
 colnames(P_fut) <- paste0("t", 1:ncol(P_fut))
 
 # FUTURE d_aln scenario = mean training d_aln
-mf <- model.frame(Best_model_3_bc)
+mf <- model.frame(Best_model_2_bc)
 fit_d <- lm(d_aln ~ sin(4*pi*t_aln) + cos(4*pi*t_aln), data = D)
 d_future <- predict(fit_d, newdata = data.frame(t_aln = t_future))
 
 
 # Assemble NEWDATA matching the exact terms the model uses
-need       <- attr(terms(Best_model_3_bc), "term.labels")
+need       <- attr(terms(Best_model_2_bc), "term.labels")
 tcols_used <- intersect(paste0("t", 1:6), need)
 
 newdata_bc <- data.frame(row = seq_along(t_future))
@@ -577,7 +572,7 @@ stopifnot(all(setdiff(need, names(newdata_bc)) == character(0)))
 stopifnot(nrow(newdata_bc) == length(t_future))
 
 # Forecast on Box–Cox scale
-fc_bc <- predict(Best_model_3_bc, newdata = newdata_bc, interval = "prediction", level = 0.95)
+fc_bc <- predict(Best_model_2_bc, newdata = newdata_bc, interval = "prediction", level = 0.95)
 
 # Inverse Box–Cox helper
 inv_boxcox <- function(z, lambda) {
@@ -590,7 +585,7 @@ lwr_fut <- inv_boxcox(fc_bc[, "lwr"], opt.lambda)
 upr_fut <- inv_boxcox(fc_bc[, "upr"], opt.lambda)
 
 # Historical fitted on training frame 
-pred_hist_bc <- predict(Best_model_3_bc, newdata = mf)
+pred_hist_bc <- predict(Best_model_2_bc, newdata = mf)
 fit_hist <- inv_boxcox(pred_hist_bc, opt.lambda)
 
 ## =============================
