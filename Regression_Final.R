@@ -381,6 +381,7 @@ print(summary_tbl[order(summary_tbl$cvm_min), ], row.names = FALSE)
 best_idx_1se    <- which.min(summary_tbl$cvm_1se)
 best_alpha_1se  <- summary_tbl$alpha[best_idx_1se]
 best_cv_1se     <- cv_list[[as.character(best_alpha_1se)]]
+best_lambda_1se <- summary_tbl$lambda_1se[best_idx_1se] 
 cat("Best by lambda.1se:  alpha =", best_alpha_1se, " lambda =", best_lambda_1se, "\n\n")
 
 
@@ -606,24 +607,34 @@ lwr_fut_n   <- as.numeric(lwr_fut)
 upr_fut_n   <- as.numeric(upr_fut)
 
 op <- par(mar = c(4,4,2,1))
+
+# plot as before, let it draw the regular 5-year ticks
+x_all <- c(as.numeric(t_aln), as.numeric(t_future))
+y_all <- c(y_obs_bt, fit_hist_n, lwr_fut_n, upr_fut_n)
 plot(as.numeric(t_aln), y_obs_bt, type = "l",
      xlab = "Time", ylab = "y",
-     main = "Forecast to 2026 with 95% Prediction Intervals")
-graphics::lines(as.numeric(t_aln),   fit_hist_n,  type = "l", lwd = 2, col = "blue")
-graphics::lines(as.numeric(t_future), fit_fut_n,  type = "l", lwd = 2, col = "red")
+     main = "Forecast to 2026 with 95% Prediction Intervals",
+     xlim = range(x_all, na.rm = TRUE),
+     ylim = range(y_all, na.rm = TRUE))
+
+# fitted + forecast + PI
+graphics::lines(as.numeric(t_aln),    fit_hist_n,  lwd = 2, col = "blue")
+graphics::lines(as.numeric(t_future), fit_fut_n,   lwd = 2, col = "red")
 polygon(c(as.numeric(t_future), rev(as.numeric(t_future))),
         c(lwr_fut_n, rev(upr_fut_n)),
         border = NA, col = adjustcolor("red", 0.2))
+
+# add the three dotted year markers
+abline(v = 2024, lty = 2, col = "darkgray", lwd = 1.5)
+abline(v = 2025, lty = 2, col = "darkgray", lwd = 1.5)
+abline(v = 2026, lty = 2, col = "darkgray", lwd = 1.5)
+
+
 legend("topleft",
        legend = c("Observed", "Fitted (hist)", "Forecast", "95% PI"),
        lty = c(1,1,1,NA), lwd = c(1,2,2,NA),
        pch = c(NA, NA, NA, 15),
        col = c("black","blue","red", adjustcolor("red", 0.2)),
        pt.cex = 2, bty = "n")
+
 par(op)
-
-
-
-
-
-
