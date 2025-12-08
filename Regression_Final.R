@@ -57,9 +57,8 @@ RegressionDiagnosicsTests <- function(
   # Testing normality and the homogeneity of the variance
   residuals.model = residuals(model) #extracting the residuals
   print(shapiro.test(residuals.model))
-  n <- length(residuals.model)  # should be 183432
+  n <- length(residuals.model) 
   
-  # create 6 groups of size 30572 (last one may be slightly shorter)
   seg <- factor(rep(1:6, each = ceiling(n / 6))[1:n])
   
   fligner.test(residuals.model, seg)
@@ -182,7 +181,7 @@ plot(APSE, pch = 16, type = "b")
 points(which.min(APSE), APSE[which.min(APSE)],
        col = adjustcolor("red", 0.5), cex = 1.5, pch = 16)
 
-## k-fold CV with harmonics
+## k-fold CV
 set.seed(1)
 Shuffle <- sample(1:n, n, replace = FALSE)
 y.shuf  <- df$y[Shuffle]
@@ -226,7 +225,7 @@ points(indx, CV.Err[indx], pch = 16, col = adjustcolor("red", 0.5), cex = 1.5)
 
 round(data.frame(output, APSE, CV.Err = CV.Err), 4)
 
-## Final best model example
+## Final best model 
 Best_model_1 <- lm(y ~ poly(t_aln, 3) + d_aln +
                      sin(4*pi*t_aln) + cos(4*pi*t_aln),
                    data = df)
@@ -550,7 +549,7 @@ t_future <- seq(from = last_t + step, to = end_t, by = step)
 P_fut <- as.data.frame(predict(P_basis, newdata = t_future))
 colnames(P_fut) <- paste0("t", 1:ncol(P_fut))
 
-# FUTURE d_aln scenario = mean training d_aln
+# FUTURE d_aln scenario 
 mf <- model.frame(Best_model_2_bc)
 fit_d <- lm(d_aln ~ sin(4*pi*t_aln) + cos(4*pi*t_aln), data = D)
 d_future <- predict(fit_d, newdata = data.frame(t_aln = t_future))
@@ -603,7 +602,7 @@ upr_fut_n   <- as.numeric(upr_fut)
 
 op <- par(mar = c(4,4,2,1))
 
-# plot as before, let it draw the regular 5-year ticks
+# draw the regular 5-year ticks
 x_all <- c(as.numeric(t_aln), as.numeric(t_future))
 y_all <- c(y_obs_bt, fit_hist_n, lwr_fut_n, upr_fut_n)
 plot(as.numeric(t_aln), y_obs_bt, type = "l",
