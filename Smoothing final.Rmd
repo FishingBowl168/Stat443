@@ -1,0 +1,396 @@
+---
+title: "Smoothing"
+output: pdf_document
+date: "2025-12-06"
+---
+
+```{r initialization, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(forecast)
+source("Data_Cleaning.R") 
+
+Energy_monthly$price_transformed <- if (opt.lambda == 0) {
+  log(Energy_monthly$price_monthly_avg)
+} else {
+  (Energy_monthly$price_monthly_avg^opt.lambda - 1) / opt.lambda
+}
+```
+
+Data Preparation
+```{r}
+# --- Prerequisites: Constants ---
+N_train <- 226 # 90% Training Length
+N_test <- 26   # 10% Validation Length
+
+# --- 1. Prepare Base Transformed Time Series (Box-Cox) ---
+
+# A. Price Transformed TS (Full Series)
+price_transformed_ts <- ts(Energy_monthly$price_transformed,
+                           start = c(start_y, start_m), # Assuming start_y and start_m are defined
+                           frequency = 12)
+
+# --- 2. Split Price Data (Box-Cox, Un-differenced Levels) ---
+
+time_index <- time(price_transformed_ts)
+train_end_time <- time_index[N_train]
+
+# Price Training Set (Used for fitting Holt-Winters)
+training_data <- window(price_transformed_ts, 
+                        end = train_end_time)
+
+# Price Validation Set (Used for APSE calculation)
+validation_data <- window(price_transformed_ts, 
+                          start = time_index[N_train + 1])
+```
+
+Residual diagnostic function
+```{r}
+#Residual Diagnostic Functions
+
+RegressionDiagnosicsPlots <- function(model) {
+  # 1. Clean residuals once and store in a variable
+  valid_residuals <- na.omit(as.numeric(model$residuals))
+  
+  # Check if enough data remains to plot
+  if (length(valid_residuals) < 2) {
+      stop("Residuals vector is too short after removing NAs. Cannot plot diagnostics.")
+  }
+
+  # setting up the plot layout
+  layout_matrix <- matrix(c(1, 2, 3, 4, 5, 5), nrow = 3, byrow = TRUE)
+  layout(layout_matrix)
+
+  # filling up the layout with the actual plots
+  hist(
+    valid_residuals,
+    breaks = 20, # <--- FIX IS HERE: Manually set the number of bins
+    xlab = "Residuals",
+    main = paste("Model =", deparse(substitute(model)))
+  )
+  # Apply valid_residuals to all subsequent calls:
+  car::qqPlot(
+    valid_residuals,
+    pch = 16,
+    col = adjustcolor("black", 0.7),
+    xlab = "Theoretical Quantiles (Normal)",
+    ylab = "Sample Quantiles (r.hat)",
+    main = "Normal Q-Q Plot"
+  )
+  # For plot vs fitted, we must also clean the fitted values
+  valid_fitted <- na.omit(as.numeric(model$fitted))
+  
+  # Ensure fitted and residuals are the same length for plotting
+  # We assume the fitted values and residuals align after NA removal
+  plot(
+    valid_fitted[1:length(valid_residuals)],
+    valid_residuals,
+    pch = 16,
+    col = adjustcolor("black", 0.5),
+    xlab = "Fitted Values",
+    ylab = "Residuals"
+  )
+  abline(h = 0, lty = 2, col = 'red')
+  plot(
+    valid_residuals, # Residuals vs index (Time)
+    pch = 16,
+    col = adjustcolor("black", 0.5),
+    xlab = "Time",
+    ylab = "Residuals"
+  )
+  abline(h = 0, lty = 2, col = 'red')
+  acf(valid_residuals) # sample acf plot of residuals
+  par(mfrow = c(1, 1)) # resetting the plot layout
+}
+
+#----------------------
+RegressionDiagnosicsTests <- function(
+  model,
+  Fligner.test.segments = NULL 
+) {
+  residuals.model = residuals(model) # Extracting the residuals
+  N = length(residuals.model) # Total number of residuals
+
+  # --- Dynamic Segment Calculation ---
+  if (is.null(Fligner.test.segments)) {
+    num_segments <- 6 
+    Fligner.test.segments <- factor(gl(
+      num_segments, 
+      ceiling(N / num_segments), 
+      length = N
+    ))
+  } else {
+    # If the user provides a vector, convert it to a factor for the test
+    Fligner.test.segments <- factor(Fligner.test.segments)
+  }
+
+  # Testing normality and the homogeneity of the variance
+  print(shapiro.test(residuals.model)) # Shapiro-Wilk test
+  print(ks.test(residuals.model, "pnorm")) # Kolmogorov-Smirnov test
+
+  # Fligner's test for homogeneity of variance across dynamic segments
+  print(fligner.test(residuals.model, Fligner.test.segments))
+
+  # Testing randomness of the residuals
+  par(mfrow = c(1, 1))
+  print(randtests::runs.test(residuals.model, plot = TRUE))
+}
+```
+
+Using the Box-cox transformed data, try Holt-Winters Triple Smoothing 
+
+**Holt-Winters Triple Smoothing**
+Fit Model
+```{r}
+hw_mult_model <- HoltWinters(training_data, seasonal = "multiplicative")
+hw_mult_model$residuals = residuals(hw_mult_model)
+
+hw_add_model <- HoltWinters(training_data, seasonal = "additive")
+hw_add_model$residuals = residuals(hw_add_model)
+```
+
+Residual Diagnostics
+```{r}
+print("-----------------HW Multiplicative-------------------")
+
+RegressionDiagnosicsPlots(hw_mult_model)
+RegressionDiagnosicsTests(hw_mult_model)
+
+print("-----------------HW Additive-------------------")
+
+RegressionDiagnosicsPlots(hw_add_model)
+RegressionDiagnosicsTests(hw_add_model)
+```
+
+AIC/BIC calculation
+```{r}
+# --- Prerequisites: Assumes hw_add_model and hw_mult_model are defined ---
+
+# Function to calculate LL, AIC, AICc, and BIC manually for HoltWinters objects
+calculate_hw_metrics <- function(hw_model) {
+  
+  # 1. Define Constants
+  n_obs <- length(hw_model$x) # Number of observations used in the fit
+  sse_val <- hw_model$SSE     # Sum of Squared Errors
+  k_val <- 16                 # Number of estimated parameters (3 smoothing params + 13 initial states)
+  
+  # 2. Calculate Log-Likelihood (LL) using the standard formula:
+  # LL = -0.5 * n * log(2*pi) - 0.5 * n * log(SSE/n) - n/2 
+  ll_val <- -0.5 * n_obs * log(2 * pi) - 0.5 * n_obs * log(sse_val / n_obs) - n_obs / 2
+  
+  # 3. Calculate AIC, AICc, and BIC
+  
+  # AIC = -2 * LL + 2 * k
+  aic_val <- -2 * ll_val + 2 * k_val
+  
+  # BIC = -2 * LL + k * log(n)
+  bic_val <- -2 * ll_val + k_val * log(n_obs)
+  
+  # AICc = AIC + 2*k*(k+1) / (n - k - 1)
+  if (n_obs - k_val - 1 > 0) {
+    aic_c_correction <- 2 * k_val * (k_val + 1) / (n_obs - k_val - 1)
+    aic_c_val <- aic_val + aic_c_correction
+  } else {
+    aic_c_val <- Inf
+  }
+  
+  # 4. Return results as a list
+  return(list(
+    LL = round(ll_val, 4),
+    AIC = round(aic_val, 4),
+    AICc = round(aic_c_val, 4),
+    BIC = round(bic_val, 4)
+  ))
+}
+
+# --- Calculation Loop (Applying the function to both models) ---
+
+add_metrics <- calculate_hw_metrics(hw_add_model)
+mult_metrics <- calculate_hw_metrics(hw_mult_model)
+
+cat("==================================================\n")
+cat("Holt-Winters Information Criteria Comparison:\n")
+cat("==================================================\n")
+cat("## Additive Model (HW(A))\n")
+print(add_metrics)
+
+cat("\n##  Multiplicative Model (HW(M))\n")
+print(mult_metrics)
+cat("==================================================\n")
+```
+
+APSE Calculation
+```{r}
+# --- Prerequisites: Assumes hw_add_model, hw_mult_model, validation_data, and opt.lambda are defined ---
+
+# 1. Inverse Box-Cox Function (Needed for Original Scale Calculation)
+BoxCox.inverse <- function(y, lambda) {
+  if (lambda == 0) {
+    return(exp(y))
+  } else {
+    return((y * lambda + 1)^(1 / lambda))
+  }
+}
+
+# 2. Define Validation Time Series and Constants
+validation_data_ts <- ts(validation_data, frequency = 12)
+fc_steps <- length(validation_data)
+
+# --- 3. APSE Calculation Function ---
+
+calculate_hw_apse <- function(hw_model) {
+  
+  # A. Generate Forecast
+  hw_forecast <- forecast(hw_model, h = fc_steps)
+  
+  # B. Transform Forecast and Validation Data to Original Scale
+  pred_original_scale <- BoxCox.inverse(hw_forecast$mean, opt.lambda)
+  validation_original_scale <- BoxCox.inverse(validation_data_ts, opt.lambda)
+  
+  # C. Convert to Vectors and Calculate APSE (CRITICAL FIX)
+  
+  # The mean APSE is calculated on the two vectors, ignoring time index issues
+  pred_vector <- as.vector(pred_original_scale)
+  validation_vector <- as.vector(validation_original_scale)
+  
+  # Check lengths before subtraction
+  if (length(pred_vector) != length(validation_vector)) {
+      warning("Length mismatch between forecast and validation vectors.")
+      return(NaN)
+  }
+  
+  squared_error <- (pred_vector - validation_vector)^2
+  apse_val <- mean(squared_error)
+  
+  return(round(apse_val, 4))
+}
+
+# --- 4. Execute Calculation for Both Models ---
+
+apse_additive <- calculate_hw_apse(hw_add_model)
+apse_multiplicative <- calculate_hw_apse(hw_mult_model)
+
+cat("==================================================\n")
+cat("Holt-Winters APSE Comparison (Original Price Scale):\n")
+cat("==================================================\n")
+cat(paste0("Additive Model APSE: ", apse_additive, "\n"))
+cat(paste0("Multiplicative Model APSE: ", apse_multiplicative, "\n"))
+cat("==================================================\n")
+```
+
+
+Prediction (transformed)
+```{r}
+# --- Prerequisites: Utility Function Definitions ---
+
+# Inverse Box-Cox function (for lambda != 0)
+inverse_boxcox <- function(y, lambda) {
+  return((y * lambda + 1)^(1/lambda))
+}
+
+# Define Utility Function to Clean Data for plotting lines
+clean_forecast_data <- function(y_data, time_index) {
+  is_finite <- is.finite(y_data) 
+  return(list(y_clean = y_data[is_finite], x_clean = time_index[is_finite]))
+}
+
+# --- 1. Generate Prediction Matrix and Time Index Calculation ---
+
+# Define the original, untransformed historical data (for plotting context)
+# Assuming Energy_monthly$price_monthly_avg, start_y, and start_m are available
+price_original_ts <- ts(Energy_monthly$price_monthly_avg,
+                       start = c(start_y, start_m),
+                       frequency = 12)
+original_ts <- price_original_ts
+end_time_hist <- time(original_ts)[length(time(original_ts))]
+
+# CRITICAL: Generate Prediction Matrix (in Transformed Units)
+hw_pred_matrix <- predict(
+  hw_add_model, 
+  n.ahead = 36, 
+  prediction.interval = TRUE,
+  level = 0.95
+)
+
+# Get vertical line indices (1, 2, 3 years ahead) (FIXED: Defined early)
+v_lines <- c(end_time_hist + 1, end_time_hist + 2, end_time_hist + 3) 
+
+
+# --- 2. Transformed Scale Plot (Plot 1) ---
+
+# Set up the plotting area for 1 row and 2 columns
+par(mfrow = c(1, 2), mar = c(4, 4, 3, 2) + 0.1)
+
+# Plot the transformed fit directly using the simpler predict output
+# Note: The 'predict' output contains the time index information needed for plotting.
+pred_hw_add <- predict(hw_add_model, n.ahead = 36, prediction.interval = T, level = 0.95)
+plot(hw_add_model, pred_hw_add,
+     main = "Additive Holt-Winters Smoothing (Transformed data)",
+     xlab = "Time",
+     ylab = "Price (Transformed)")
+
+# Add Vertical Lines for Horizons
+abline(v = v_lines[1], col = "red", lty = 3)
+abline(v = v_lines[2], col = "red", lty = 3)
+abline(v = v_lines[3], col = "red", lty = 3)
+
+legend("bottomleft", 
+       legend = c("Historical", "Forecast Mean", "95% PI"),
+       col = c("black", "red", "lightblue"),
+       lwd = c(1, 2, 1), lty = c(1, 1, 1), cex = 0.7)
+
+# --- 3. Original Scale Plot (Plot 2 - Manual Transformation) ---
+
+# Apply Inverse Transformation (Manual Extraction)
+mean_original <- inverse_boxcox(hw_pred_matrix[, 1], opt.lambda)
+lower_95 <- inverse_boxcox(hw_pred_matrix[, 2], opt.lambda)
+upper_95 <- inverse_boxcox(hw_pred_matrix[, 3], opt.lambda)
+
+# Create future time index for forecast lines
+time_forecast_ts <- ts(
+    data = mean_original,
+    start = end_time_hist + (1/frequency(original_ts)),
+    frequency = 12
+)
+time_forecast_index <- time(time_forecast_ts)
+x_lim <- range(time(original_ts), time_forecast_index)
+
+# Set plot limits (CRITICAL: Use Y-axis constraint)
+y_min <- min(c(original_ts, lower_95, upper_95), na.rm = TRUE)
+y_max <- max(c(original_ts, lower_95, upper_95), na.rm = TRUE) * 1.05 # Add 5% buffer
+
+# Plot Historical Data
+plot(
+  original_ts,
+  main = "Additive Holt-Winters Smoothing (Original data)",
+  xlab = "Time",
+  ylab = "Price (Original)",
+  ylim = c(y_min, y_max),
+  xlim = x_lim,
+  col = "black"
+)
+
+# Overlay the Prediction Interval (PI) Bounds
+data_lower <- clean_forecast_data(lower_95, time_forecast_index)
+lines(data_lower$x_clean, data_lower$y_clean, col = "gray", lty = 2)
+data_upper <- clean_forecast_data(upper_95, time_forecast_index)
+lines(data_upper$x_clean, data_upper$y_clean, col = "gray", lty = 2)
+
+# Overlay the Point Forecast (Mean)
+data_mean <- clean_forecast_data(mean_original, time_forecast_index)
+lines(data_mean$x_clean, data_mean$y_clean, col = "blue", lwd = 2)
+
+# Add Vertical Lines for Horizons and Legend
+abline(v = v_lines[1], col = "red", lty = 3)
+abline(v = v_lines[2], col = "red", lty = 3)
+abline(v = v_lines[3], col = "red", lty = 3)
+
+legend("bottomleft", 
+       legend = c("Historical", "Forecast Mean", "95% PI"),
+       col = c("black", "blue", "gray"),
+       lwd = c(1, 1, 1), lty = c(1, 1, 2), cex = 0.5)
+
+# Reset plotting environment
+par(mfrow = c(1, 1))
+```
+

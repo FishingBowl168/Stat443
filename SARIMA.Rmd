@@ -1,0 +1,508 @@
+---
+title: "SARIMA"
+output: pdf_document
+date: "2025-12-07"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+source("Data_Cleaning.R") 
+Energy_monthly$price_transformed <- if (opt.lambda == 0) {
+  log(Energy_monthly$price_monthly_avg)
+} else {
+  (Energy_monthly$price_monthly_avg^opt.lambda - 1) / opt.lambda
+}
+```
+
+Training/Test Sets
+```{r}
+price_transformed_ts <- ts(Energy_monthly$price_transformed,
+                           start = c(start_y, start_m),
+                           frequency = 12)
+
+# --- 1. Define Split Points for N = 252 ---
+
+N_total <- 252
+N_train <- 226 # 90%
+N_test <- 26   # 10%
+
+# Determine the end time for the training set (the 226th observation)
+time_index <- time(price_transformed_ts)
+train_end_time <- time_index[N_train]
+
+# --- 2. Split the Data using window() ---
+
+# 1. Training Set (The first 226 observations)
+training_data <- window(
+  price_transformed_ts, 
+  start = start(price_transformed_ts), 
+  end = train_end_time
+)
+
+# 2. Validation/Test Set (The remaining 26 observations)
+validation_data <- window(
+  price_transformed_ts, 
+  start = time_index[N_train + 1], 
+  end = end(price_transformed_ts)
+)
+```
+
+Finding diff order with acf/pacf plots
+```{r}
+price_lag6D1 = diff(training_data, lag = 6)
+price_lag6d1 = diff(training_data, differences = 1)
+price_lag6d1D1 = diff(diff(training_data, lag = 6), differences = 1)
+price_lag6d2D1 = diff(diff(training_data, lag = 6), differences = 2)
+par(mfrow = c(2,2))
+acf(price_lag6d1)
+acf(price_lag6D1)
+acf(price_lag6d1D1)
+acf(price_lag6d2D1)
+
+# using d = D = 1, s = 6
+price_diff = price_lag6d1D1
+par(mfrow = c(3,1))
+acf(price_lag6d1D1, lag.max = 24)
+pacf(price_lag6d1D1, lag.max = 24)
+acf(price_diff^2)
+```
+
+Model fitting
+```{r}
+# --- 1. Setup and Model Definition ---
+
+library(astsa)
+
+# Fixed Differencing and Seasonal Period
+d_order <- 1; D_order <- 1; s_period <- 6 
+
+# New Candidate Orders (Paired by Index)
+p_list <- c(0, 2, 1, 0, 2) # p
+q_list <- c(2, 0, 1, 8, 6) # q
+P_list <- c(0, 3, 2) # P
+Q_list <- c(1, 0, 1) # Q
+
+# Generate the 15 combinations: (p, q) x (P, Q)
+sarima_candidates <- list()
+idx <- 1
+
+# Iterate through 5 non-seasonal pairs
+for (j in 1:length(p_list)) {
+  # Iterate through 3 seasonal pairs
+  for (k in 1:length(P_list)) {
+    # Store as [p, q, P, Q]
+    sarima_candidates[[idx]] <- c(p_list[j], q_list[j], P_list[k], Q_list[k])
+    idx <- idx + 1
+  }
+}
+
+# Master list to store ALL successful model fits
+fitted_sarima_models <- list()
+
+# --- 2. Iterative Fitting and Storage Loop ---
+
+for (i in 1:length(sarima_candidates)) {
+  
+  orders <- sarima_candidates[[i]]
+  p_order <- orders[1]; q_order <- orders[2]; P_order <- orders[3]; Q_order <- orders[4]
+  
+  model_name <- paste0("SARIMA(", p_order, ",", d_order, ",", q_order, ") x (", 
+                       P_order, ",", D_order, ",", Q_order, ")_", s_period)
+  
+  cat(paste0("\n--- Fitting Model ", i, " of 15: ", model_name, " ---\n"))
+  
+  tryCatch({
+    # A. Fit the model and capture the output
+    model_output <- sarima(
+      xdata = training_data, 
+      p = p_order, d = d_order, q = q_order, 
+      P = P_order, D = D_order, Q = Q_order, 
+      S = s_period,
+    )
+
+    # B. Store the complete output list
+    fitted_sarima_models[[model_name]] <- model_output
+    
+  }, error = function(e) {
+    # If the model fails, store NA and log the error
+    cat(paste0("   Error: Model failed to converge. Message: ", e$message, "\n"))
+    # Store NA instead of the model output list
+    fitted_sarima_models[[model_name]] <- NA 
+  })
+}
+```
+
+Potential model AIC/BIC values
+```{r}
+target_models <- c(
+    "SARIMA(1,1,1) x (0,1,1)_6",
+    "SARIMA(1,1,1) x (2,1,1)_6",
+    "SARIMA(0,1,8) x (0,1,1)_6",
+    "SARIMA(2,1,6) x (0,1,1)_6",
+    "SARIMA(2,1,6) x (2,1,1)_6"
+)
+
+for (m in target_models) {
+  cat(round(fitted_sarima_models[[m]]$ICs, 4), "\n")
+}
+```
+
+Formal residual diagnostic tests function
+```{r}
+SARIMADiagnosticsTests <- function(
+  model,
+  Ljung.test.lag,
+  Fligner.test.segments = NULL 
+) {
+  residuals.model <- as.numeric(model$fit$resid) # Extracting the residuals
+  N = length(residuals.model) # Total number of residuals
+
+  # --- 1. Dynamic Segment Calculation for Fligner-Killeen ---
+  if (is.null(Fligner.test.segments)) {
+    # Default to 6 segments if none are provided
+    num_segments <- 6 
+    Fligner.test.segments <- factor(gl(
+      num_segments, 
+      ceiling(N / num_segments), 
+      length = N
+    ))
+  } else {
+    # If the user provides a vector, convert it to a factor for the test
+    # Ensure the length matches the residuals; otherwise, an error will occur
+    if (length(Fligner.test.segments) != N) {
+      stop("Error: Length of Fligner.test.segments must equal the length of the residuals.")
+    }
+    Fligner.test.segments <- factor(Fligner.test.segments)
+  }
+
+  # --- 2. Testing Normality and Homogeneity of Variance ---
+  
+  print(shapiro.test(residuals.model)) # Shapiro-Wilk test 
+
+  print(fligner.test(residuals.model, Fligner.test.segments))
+
+  # --- 3. Testing Randomness (Autocorrelation) ---
+  
+  # Ljung-Box test for randomness of the residuals (replaces Runs test)
+  # H0: Residuals are White Noise (uncorrelated). We want p-value > 0.05.
+  print(Box.test(residuals.model, lag = Ljung.test.lag, type = "Ljung-Box"))
+}
+```
+
+Formal residual tests
+```{r}
+model13 = fitted_sarima_models[[13]]
+model15 = fitted_sarima_models[[15]]
+
+cat("===========Model #13: SARIMA(2,1,6)×(0,1,1)6===========")
+SARIMADiagnosticsTests(model13, Ljung.test.lag = 24)
+cat("===========Model #15: SARIMA(2,1,6)×(2,1,1)6===========")
+SARIMADiagnosticsTests(model15, Ljung.test.lag = 24)
+```
+
+Plot forecast wrapper function
+```{r}
+sarima_sarimax_plot_wrapper <- function(
+  model_fit_object,
+  training_ts,
+  validation_ts,
+  opt_lambda,
+  forecast_length,
+  xreg_train = NULL, 
+  xreg_forecast = NULL
+) {
+  # --- 0. Define Parameters from Model Object ---
+  # Extract orders from the fitted object's $fit component
+  p <- model_fit_object$fit$arma[1]
+  d <- model_fit_object$fit$arma[6]
+  q <- model_fit_object$fit$arma[2]
+  P <- model_fit_object$fit$arma[3]
+  D <- model_fit_object$fit$arma[7]
+  Q <- model_fit_object$fit$arma[4]
+  S <- model_fit_object$fit$arma[5]
+  
+  # Set up the title based on whether xreg exists
+  is_sarimax <- !is.null(xreg_train)
+  model_type <- ifelse(is_sarimax, "SARIMAX", "SARIMA")
+  
+  par(mfrow = c(2, 1))
+  
+  title.plot.base <- substitute(
+    TYPE(pv, dv, qv)(Pv, Dv, Qv)[Sv] + Xreg,
+    list(
+      TYPE = model_type,
+      pv = p, dv = d, qv = q,
+      Pv = P, Dv = D, Qv = Q,
+      Sv = S,
+      Xreg = ifelse(is_sarimax, "+Demand", "")
+    )
+  )
+  
+  # =======================================================
+  #               PLOT 1: TRANSFORMED SCALE
+  # =======================================================
+  
+  # Generate the Forecast (Pass xreg_forecast if it exists)
+  forecast_output <- sarima.for(
+    training_ts,
+    n.ahead = forecast_length,
+    plot.all = TRUE,
+    p, d, q, P, D, Q, S,
+    newxreg = xreg_forecast, # Only used if provided
+    fit = model_fit_object$fit,
+    ylab = "Box-Cox(observed values)",
+    pcol = adjustcolor("red", 0.5),
+    pch = 16
+  )
+  
+  title(main = c("Transformed Forecast", title.plot.base))
+  
+  # Overlay validation data points (on the transformed scale)
+  points(
+    validation_ts,
+    pch = 16,
+    col = adjustcolor('blue', 0.6),
+    cex = 0.7
+  )
+  
+  # =======================================================
+  #               PLOT 2: ORIGINAL SCALE
+  # =======================================================
+  
+  predicted_transformed <- forecast_output$pred
+  SE_prediction <- forecast_output$se
+  
+  # Calculate PIs on Transformed Scale (95% PI)
+  lower_transformed <- predicted_transformed - 1.96 * SE_prediction
+  upper_transformed <- predicted_transformed + 1.96 * SE_prediction
+  
+  # Inverse Box-Cox Transformation (Non-zero lambda)
+  # X = (Y * lambda + 1)^(1/lambda)
+  X_pred <- (predicted_transformed * opt_lambda + 1)^(1 / opt_lambda)
+  X_lower <- (lower_transformed * opt_lambda + 1)^(1 / opt_lambda)
+  X_upper <- (upper_transformed * opt_lambda + 1)^(1 / opt_lambda)
+  
+  # Inverse Box-Cox Transformation for Historical and Validation Data
+  original_training_data <- (training_ts * opt_lambda + 1)^(1 / opt_lambda)
+  original_validation_data <- (validation_ts * opt.lambda + 1)^(1 / opt.lambda)
+  
+  # ts.plot sets up the axis and plots the combined historical data + forecast line
+  ts.plot(
+    ts(c(original_training_data, X_pred), 
+       start = start(original_training_data), 
+       frequency = frequency(original_training_data)),
+    ylab = 'Original Observed Values',
+    col = 'black',
+    main = c("Original Scale Forecast", title.plot.base)
+  )
+  
+  # Add Prediction Interval Polygon (Shaded Area)
+  x_time <- c(time(X_upper), rev(time(X_upper)))
+  y_bounds <- c(X_upper, rev(X_lower))
+  polygon(x_time, y_bounds, col = adjustcolor("grey", 0.3), border = NA)
+  
+  # Re-plot the Forecast Line and Add Validation Points
+  lines(X_pred, col = 'red', type = 'b', pch = 16, cex = 0.5)
+  lines(X_lower, col = 'blue', lty = 2)
+  lines(X_upper, col = 'blue', lty = 2)
+  
+  # Add validation data (Original Scale)
+  points(
+    original_validation_data,
+    pch = 16,
+    col = adjustcolor('blue', 0.8),
+    cex = 0.7
+  )
+  
+  # Reset plot layout
+  par(mfrow = c(1, 1))
+  
+  return(forecast_output)
+}
+```
+
+Plot forecast for model 15
+```{r}
+sarima_model_15_fit = fitted_sarima_models[[15]]
+sarima_model_15_for = sarima_sarimax_plot_wrapper(
+  model_fit_object = sarima_model_15_fit,
+  training_ts = training_data,
+  validation_ts = validation_data,
+  opt_lambda = opt.lambda,
+  forecast_length = 26
+)
+```
+
+APSE Calculation
+```{r}
+BoxCox.inverse <- function(y, lambda) {
+  # X = (Y * lambda + 1)^(1/lambda)
+  return((y * lambda + 1)^(1/lambda))
+}
+
+predicted_transformed <- sarima_model_15_for$pred
+predicted_original_scale <- BoxCox.inverse(predicted_transformed, opt.lambda)
+
+validation_original_scale <- BoxCox.inverse(validation_data, opt.lambda)
+
+# Calculate squared error on the identical original scale
+squared_error <- (predicted_original_scale - validation_original_scale)^2
+APSE_value <- mean(squared_error)
+
+cat(paste("APSE: ", APSE_value, "\n"))
+```
+
+==================================
+SARIMAX with demand regressor
+==================================
+
+Price_data and demand regressor matrix
+```{r}
+# --- 1. Define Model & Differencing Parameters ---
+# Model 15 Parameters (SARIMA(2, 1, 6) x (2, 1, 1)_6)
+p_order <- 2; q_order <- 6
+P_order <- 2; Q_order <- 1
+# Differencing Parameters
+d_order <- 1; D_order <- 1; S_period <- 6
+
+# Data Lengths
+N_train <- 226
+N_test <- 26
+N_diff <- d_order + (D_order * S_period) # 1 + 6 = 7 observations lost
+
+# --- 2. Prepare Stationary Price Data (Y) ---
+# We manually difference the training data so we can pass d=0 to the function
+price_stationary_ts <- diff(training_data, lag = S_period)
+price_stationary_ts <- diff(price_stationary_ts, lag = 1)
+
+# --- 3. Prepare Stationary Demand Data (X) ---
+demand_ts <- Energy_monthly$demand_monthly_avg
+demand_transformed_raw <- (demand_ts^opt.lambda - 1) / opt.lambda
+
+demand_transformed_ts <- ts(
+  demand_transformed_raw,
+  start = c(start_y, start_m), 
+  frequency = 12
+)
+
+demand_stationary_ts <- diff(demand_transformed_ts, lag = S_period)
+demand_stationary_ts <- diff(demand_stationary_ts, lag = 1)
+
+# Calculate Split Points for Regressors
+N_train_stationary <- N_train - N_diff # 219
+N_total_stationary <- length(demand_stationary_ts)
+
+# Create xreg_training (Must match Price Length: 219)
+# We use direct subsetting to avoid time index issues
+xreg_training <- as.matrix(demand_stationary_ts[1:N_train_stationary])
+
+# Create xreg_forecast (Must match n.ahead: 26)
+xreg_forecast <- as.matrix(demand_stationary_ts[(N_train_stationary + 1):(N_train_stationary + N_test)])
+```
+
+
+SARIMAX model fitting
+```{r}
+sarimax_model_fit <- sarima(
+  xdata = price_stationary_ts, # Length 219
+  p = p_order, d = 0, q = q_order, # d=0 (Already differenced)
+  P = P_order, D = 0, Q = Q_order, # D=0 (Already differenced)
+  S = S_period,
+  xreg = xreg_training, # Length 219 (Matches xdata perfectly)
+  details = TRUE # Show diagnostic plots
+)
+```
+
+Formal residual tests
+```{r}
+SARIMADiagnosticsTests(sarimax_model_fit, Ljung.test.lag = 24)
+```
+
+Forecast for SARIMAX using model 15 parameters
+```{r}
+sarimax_forecast_obj <- sarima.for(
+  price_stationary_ts,   # The stationary training data used for fit
+  n.ahead = 26,          # Forecast horizon
+  plot = FALSE,          # Suppress default plot
+  p = 2, d = 0, q = 6,   # d=0, D=0 because input is already stationary
+  P = 2, D = 0, Q = 1,
+  S = 6, 
+  newxreg = xreg_forecast, # Stationary demand for forecast period
+  fit = sarimax_model_fit$fit
+)
+
+pred_stationary <- sarimax_forecast_obj$pred
+se_stationary <- sarimax_forecast_obj$se
+```
+
+SARIMAX undoing transformation
+```{r}
+# Start with the full training history (Box-Cox scale)
+history <- as.numeric(training_data)
+N_hist <- length(history)
+fc_steps <- 26
+
+# Initialize vector for reconstructed forecast
+reconstructed_boxcox <- numeric(fc_steps)
+
+# We need a temporary vector combining history and future slots
+temp_series <- c(history, rep(NA, fc_steps))
+
+for (i in 1:fc_steps) {
+  # Current time index in temp_series
+  t <- N_hist + i
+  
+  # The stationary prediction for this step
+  Z_t <- pred_stationary[i]
+  
+  # Apply the integration formula: Y_t = Z_t + Y_{t-1} + Y_{t-6} - Y_{t-7}
+  val <- Z_t + temp_series[t-1] + temp_series[t-6] - temp_series[t-7]
+  
+  temp_series[t] <- val
+  reconstructed_boxcox[i] <- val
+}
+
+# Create time series object for the Box-Cox forecast
+pred_boxcox_ts <- ts(
+  reconstructed_boxcox,
+  start = time(validation_data)[1],
+  frequency = 12
+)
+```
+
+
+
+SARIMAX APSE
+```{r}
+# A. Transform Forecast to Original Scale
+pred_original_scale <- (reconstructed_boxcox * opt.lambda + 1)^(1 / opt.lambda)
+
+validation_original_scale <- (validation_data * opt.lambda + 1)^(1 / opt.lambda)
+
+# C. Calculate Squared Error and APSE
+squared_error <- (pred_original_scale - validation_original_scale)^2
+apse_sarimax <- mean(squared_error)
+
+cat(paste("APSE: ", round(apse_sarimax, 4), "\n"))
+```
+
+Plotting SARIMAX forecast
+```{r}
+par(mfrow = c(1, 1))
+ts.plot(
+  training_data, # Box-Cox Training
+  pred_boxcox_ts, # Reconstructed Box-Cox Forecast
+  col = c("black", "red"),
+  ylab = "Box-Cox Transformed Price",
+  main = "SARIMAX Forecast vs Actual (Transformed Scale)"
+)
+# Add validation data
+lines(valid_original, col = "blue", type = "p", pch = 16) # Box-Cox Validation
+legend("topleft", legend=c("History", "Forecast", "Actual"), 
+       col=c("black", "red", "blue"), lty=c(1,1,NA), pch=c(NA,NA,16))
+```
+
+
+
+

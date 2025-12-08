@@ -1,0 +1,858 @@
+---
+title: "SARIMAX"
+output: pdf_document
+date: "2025-12-08"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(astsa)
+source("Data_Cleaning.R") 
+Energy_monthly$price_transformed <- if (opt.lambda == 0) {
+  log(Energy_monthly$price_monthly_avg)
+} else {
+  (Energy_monthly$price_monthly_avg^opt.lambda - 1) / opt.lambda
+}
+```
+
+Preparing stationary data via transformations
+```{r}
+S_period <- 6
+N_total <- 252
+N_train <- 226 # 90%
+N_test <- 26   # 10%
+
+d_order <- 1; D_order <- 1
+N_diff <- d_order + D_order * S_period # 7 observations lost to differencing (1 + 6)
+
+# --- 1. Prepare Base Transformed Time Series (Box-Cox) ---
+
+# A. Price Transformed TS (Full Series)
+price_transformed_ts <- ts(Energy_monthly$price_transformed,
+                           start = c(start_y, start_m),
+                           frequency = 12)
+
+# B. Demand Transformed TS (Full Series)
+demand_ts <- Energy_monthly$demand_monthly_avg
+demand_transformed_raw <- (demand_ts^opt.lambda - 1) / opt.lambda
+
+demand_transformed_ts <- ts(
+  demand_transformed_raw,
+  start = c(start_y, start_m), 
+  frequency = 12
+)
+
+# --- 2. Split Price Data (Box-Cox, Undifferenced) ---
+# This is the standard split for context and APSE calculation
+
+time_index <- time(price_transformed_ts)
+train_end_time <- time_index[N_train]
+
+# Price Training Set (Used for Reconstruction)
+training_data <- window(price_transformed_ts, 
+                        end = train_end_time)
+# Price Validation Set (Used for APSE calculation)
+validation_data <- window(price_transformed_ts, 
+                          start = time_index[N_train + 1])
+
+
+# --- 3. Create Stationary Price Training Data (Y-variable for SARIMAX Fit) ---
+price_stationary_train <- diff(training_data, lag = S_period)
+price_stationary_train <- diff(price_stationary_train, lag = 1)
+# Length: 226 - 7 = 219
+
+# --- 4. Create Stationary Demand Regressors (X-variables) ---
+
+# Difference the FULL demand series first
+demand_stationary_full <- diff(demand_transformed_ts, lag = S_period)
+demand_stationary_full <- diff(demand_stationary_full, lag = 1)
+# Total stationary length: 252 - 7 = 245
+
+# X Training Data (First 219 obs, used for sarima fit)
+xreg_training <- as.matrix(demand_stationary_full[1:219]) 
+
+# X Forecast Data (Next 26 obs, used for sarima.for)
+xreg_forecast <- as.matrix(demand_stationary_full[220:245]) 
+```
+
+Fitting SARIMAX with just demand only
+```{r}
+# --- 1. Fit the "Regression-Only" Model (p=0, q=0) ---
+# We fit a SARIMAX(0,0,0)x(0,0,0)_6 on the STATIONARY data.
+# This forces the model to explain the price purely using the Demand variable.
+
+reg_only_fit <- sarima(
+  xdata = price_stationary_train, 
+  p = 0, d = 0, q = 0, 
+  P = 0, D = 0, Q = 0, 
+  S = 6, 
+  xreg = xreg_training, 
+  details = FALSE # Suppress standard diagnostics for now
+)
+
+# Check the xreg p-value immediately to confirm significance
+print(reg_only_fit$ttable)
+
+
+# --- 2. Analyze the Residuals (What Demand Didn't Explain) ---
+# We extract the residuals from the regression fit.
+residuals_reg <- reg_only_fit$fit$resid
+
+# Plot ACF and PACF side-by-side to identify the necessary AR/MA orders
+par(mfrow = c(2, 1))
+
+acf(residuals_reg, lag.max = 24, main = "ACF of Regression Residuals")
+pacf(residuals_reg, lag.max = 24, main = "PACF of Regression Residuals")
+
+par(mfrow = c(1, 1))
+```
+
+Fitting potential models
+```{r}
+# --- 1. Setup and Model Definition ---
+
+# Fixed Differencing and Seasonal Period for BYPASS METHOD
+d_order_fit <- 0; D_order_fit <- 0; S_period <- 6
+d_order_name <- 1; D_order_name <- 1 # For printing the model name correctly
+
+# New Candidate Orders (Paired by Index)
+p_list <- c(0, 2, 1, 0, 8, 6) # Length 6
+q_list <- c(2, 0, 1, 7, 0, 2) # Length 6
+P_list <- c(0, 2, 1, 3, 2) # Length 5
+Q_list <- c(1, 0, 0, 0, 1) # Length 5
+
+# Generate the combinations: (p, q) x (P, Q)
+sarimax_candidates <- list()
+idx <- 1
+
+# Iterate through  non-seasonal pairs (j=1 to 3)
+for (j in 1:length(p_list)) {
+  # Iterate through  seasonal pairs (k=1 to 5)
+  for (k in 1:length(P_list)) {
+    # Store as [p, q, P, Q]
+    sarimax_candidates[[idx]] <- c(p_list[j], q_list[j], P_list[k], Q_list[k])
+    idx <- idx + 1
+  }
+}
+
+# Master list to store ALL successful model fits
+fitted_sarimax_models <- list()
+
+# --- 2. Iterative Fitting and Storage Loop ---
+
+for (i in 1:length(sarimax_candidates)) {
+  
+  orders <- sarimax_candidates[[i]]
+  p_order <- orders[1]; q_order <- orders[2]; P_order <- orders[3]; Q_order <- orders[4]
+  
+  model_name <- paste0("SARIMAX(", p_order, ",", d_order_name, ",", q_order, ") x (", 
+                       P_order, ",", D_order_name, ",", Q_order, ")_", S_period, " + Demand")
+  
+  cat(paste0("\n--- Fitting Model ", i, model_name, " ---\n"))
+  
+  tryCatch({
+    # A. Fit the model using stationary data and d=0, D=0 bypass
+    model_output <- sarima(
+      xdata = price_stationary_train,  # Stationary Price (Length 219)
+      p = p_order, d = d_order_fit, q = q_order,  # d=0
+      P = P_order, D = D_order_fit, Q = Q_order,  # D=0
+      S = S_period,
+      xreg = xreg_training                     # Stationary Demand (Length 219)
+    )
+    
+    # B. Store the complete output list
+    fitted_sarimax_models[[model_name]] <- model_output
+    
+  }, error = function(e) {
+    cat(paste0("    Error: Model failed to converge. Message: ", e$message, "\n"))
+    fitted_sarimax_models[[model_name]] <- NA
+  })
+}
+```
+
+Potential model AIC/BIC values
+```{r}
+# Updated list of SARIMAX models to check (using d=1, D=1 in the model name)
+target_models <- c(
+    "SARIMAX(1,1,1) x (0,1,1)_6 + Demand",
+    "SARIMAX(0,1,7) x (0,1,1)_6 + Demand",
+    "SARIMAX(0,1,7) x (2,1,1)_6 + Demand",
+    "SARIMAX(8,1,0) x (2,1,1)_6 + Demand",
+    "SARIMAX(6,1,2) x (0,1,1)_6 + Demand",
+    "SARIMAX(6,1,2) x (2,1,1)_6 + Demand"
+)
+
+# Loop through the new target models and print their ICs
+for (m in target_models) {
+  # Check if the model fit was successful (i.e., not NA)
+  if (!is.na(fitted_sarimax_models[[m]][1])) {
+    cat(paste0(m, ": ", paste(round(fitted_sarimax_models[[m]]$ICs, 4), collapse = ", ")), "\n")
+  } else {
+    cat(paste0(m, ": Model failed to converge or was not fitted.\n"))
+  }
+}
+```
+
+Formal residual diagnostic tests function
+```{r}
+SARIMADiagnosticsTests <- function(
+  model,
+  Ljung.test.lag,
+  Fligner.test.segments = NULL 
+) {
+  residuals.model <- as.numeric(model$fit$resid) # Extracting the residuals
+  N = length(residuals.model) # Total number of residuals
+
+  # --- 1. Dynamic Segment Calculation for Fligner-Killeen ---
+  if (is.null(Fligner.test.segments)) {
+    # Default to 6 segments if none are provided
+    num_segments <- 6 
+    Fligner.test.segments <- factor(gl(
+      num_segments, 
+      ceiling(N / num_segments), 
+      length = N
+    ))
+  } else {
+    # If the user provides a vector, convert it to a factor for the test
+    # Ensure the length matches the residuals; otherwise, an error will occur
+    if (length(Fligner.test.segments) != N) {
+      stop("Error: Length of Fligner.test.segments must equal the length of the residuals.")
+    }
+    Fligner.test.segments <- factor(Fligner.test.segments)
+  }
+
+  # --- 2. Testing Normality and Homogeneity of Variance ---
+  
+  print(shapiro.test(residuals.model)) # Shapiro-Wilk test 
+
+  print(fligner.test(residuals.model, Fligner.test.segments))
+
+  # --- 3. Testing Randomness (Autocorrelation) ---
+  
+  # Ljung-Box test for randomness of the residuals (replaces Runs test)
+  # H0: Residuals are White Noise (uncorrelated). We want p-value > 0.05.
+  print(Box.test(residuals.model, lag = Ljung.test.lag, type = "Ljung-Box"))
+}
+```
+
+Formal residual tests
+```{r}
+# Define the SARIMAX model names to test
+target_sarimax_models <- c(
+    "SARIMAX(0,1,7) x (0,1,1)_6 + Demand",
+    "SARIMAX(0,1,7) x (2,1,1)_6 + Demand",
+    "SARIMAX(8,1,0) x (2,1,1)_6 + Demand",
+    "SARIMAX(6,1,2) x (2,1,1)_6 + Demand"
+)
+
+# Loop through the target models and run diagnostics
+for (model_name in target_sarimax_models) {
+    
+    # Attempt to retrieve the model object safely
+    model_object <- fitted_sarimax_models[[model_name]]
+    
+    cat("\n==================================================================\n")
+    cat(paste("Diagnostic Tests for:", model_name, "\n"))
+    cat("==================================================================\n")
+    
+    # Check if the model object exists and successfully converged
+    if (!is.null(model_object) && !is.na(model_object[1])) {
+        
+        # The Ljung-Box lag (24) is appropriate for these seasonal models (S=6)
+        tryCatch({
+            SARIMADiagnosticsTests(model_object, Ljung.test.lag = 24)
+        }, error = function(e) {
+            cat(paste("  ERROR: Diagnostics failed to run. Message:", e$message, "\n"))
+        })
+        
+    } else {
+        cat("  MODEL NOT FOUND or FAILED to converge. Cannot run diagnostics.\n")
+    }
+}
+```
+
+APSE Calculations (Original Scale)
+```{r}
+# --- Prerequisites: Assumed Variables ---
+# S_period (Seasonal period, 6)
+# N_hist (Length of historical data, 226)
+
+# --- 1. Define Model and Parameters ---
+# manually change model name and parameters cuz of some errors with loop too complex
+model_name <- "SARIMAX(6,1,2) x (2,1,1)_6 + Demand"
+fc_steps <- 26
+
+# Extract specific orders for the sarima.for call
+p_order <- 6; q_order <- 2
+P_order <- 2; Q_order <- 1
+
+# Retrieve the model object
+model_object <- fitted_sarimax_models[[model_name]] 
+
+# Constants required for integration
+history_vals <- as.numeric(training_data) # Box-Cox training data (undifferenced)
+N_hist <- length(history_vals)
+
+# Pre-calculate the ORIGINAL scale validation data for APSE comparison
+validation_original_scale <- (validation_data * opt.lambda + 1)^(1 / opt.lambda) 
+
+# --- 2. GENERATE STATIONARY FORECAST (DIFFERENCES) ---
+if (is.null(model_object) || is.na(model_object[1])) {
+    stop(paste("Error: Model", model_name, "was not found or failed to converge."))
+}
+
+sarimax_forecast_obj <- sarima.for(
+    price_stationary_train,  # Stationary Price History
+    n.ahead = fc_steps,
+    plot = FALSE,
+    p = p_order, d = 0, q = q_order, # d=0, D=0 bypass
+    P = P_order, D = 0, Q = Q_order,
+    S = S_period, 
+    newxreg = xreg_forecast, # Stationary Future Demand
+    fit = model_object$fit
+)
+pred_stationary <- sarimax_forecast_obj$pred # Predicted changes (Z_t)
+
+# --- 3. RECONSTRUCT BOX-COX LEVELS (INTEGRATION) ---
+# Y_t = Z_t + Y_{t-1} + Y_{t-6} - Y_{t-7}
+reconstructed_boxcox <- numeric(fc_steps)
+temp_series <- c(history_vals, rep(NA, fc_steps))
+
+for (i in 1:fc_steps) {
+    t <- N_hist + i
+    Z_t <- pred_stationary[i]
+    
+    val <- Z_t + temp_series[t-1] + temp_series[t-6] - temp_series[t-7]
+    temp_series[t] <- val
+    reconstructed_boxcox[i] <- val
+}
+
+# --- 4. CALCULATE APSE (ORIGINAL SCALE) ---
+pred_original_scale <- (reconstructed_boxcox * opt.lambda + 1)^(1 / opt.lambda)
+
+squared_error <- (pred_original_scale - validation_original_scale)^2
+current_apse <- mean(squared_error)
+
+# --- 5. Display Result ---
+cat("\n==================================================================\n")
+cat("APSE for Selected SARIMAX Model (Original Price Scale):\n")
+cat(paste0(model_name, ": ", round(current_apse, 4), "\n"))
+cat("==================================================================\n")
+
+```
+
+Plot best SARIMAX model
+```{r}
+# --- Define Custom Functions (Required for Reconstruction) ---
+BoxCox.inverse <- function(y, lambda) {
+  if (lambda == 0) {
+    return(exp(y))
+  } else {
+    arg <- y * lambda + 1
+    arg[arg < 0] <- 0
+    return(arg^(1 / lambda))
+  }
+}
+
+reconstruct_ts <- function(stationary_series, history_vals, inverse_func, lambda) {
+    fc_steps <- length(stationary_series)
+    N_hist <- length(history_vals)
+    reconstructed_boxcox <- numeric(fc_steps)
+    temp_series <- c(history_vals, rep(NA, fc_steps))
+    
+    for (i in 1:fc_steps) {
+        t <- N_hist + i
+        Z_t <- stationary_series[i]
+        val <- Z_t + temp_series[t-1] + temp_series[t-6] - temp_series[t-7]
+        temp_series[t] <- val
+        reconstructed_boxcox[i] <- val
+    }
+    return(inverse_func(reconstructed_boxcox, lambda))
+}
+
+# --- 1. Define Model and Retrieve Fit ---
+model_name <- "SARIMAX(8,1,0) x (2,1,1)_6 + Demand"
+model_to_plot <- fitted_sarimax_models[[model_name]] 
+
+# Parameters
+fc_steps <- 26; S_period <- 6
+N_train <- length(training_data)
+N_hist <- length(training_data)
+
+if (is.null(model_to_plot)) {
+  stop(paste("Model", model_name, "not found. Ensure it was fitted and stored correctly."))
+}
+
+# --- 2. Generate Forecast and Standard Errors ---
+sarimax_forecast_obj <- sarima.for(
+    price_stationary_train,
+    n.ahead = fc_steps,
+    plot = FALSE,
+    p = 8, d = 0, q = 0,  # p=8 for AR
+    P = 2, D = 0, Q = 1,  # P=2 for SAR
+    S = S_period,
+    newxreg = xreg_forecast,
+    fit = model_to_plot$fit
+)
+pred_stationary <- sarimax_forecast_obj$pred
+se_stationary <- sarimax_forecast_obj$se
+
+# --- 3. Reconstruct Mean and CI bounds (Original Scale) ---
+Z_CRIT <- 1.96 
+lower_ci_stat <- pred_stationary - Z_CRIT * se_stationary
+upper_ci_stat <- pred_stationary + Z_CRIT * se_stationary
+
+pred_original <- reconstruct_ts(pred_stationary, training_data, BoxCox.inverse, opt.lambda)
+lower_ci_original <- reconstruct_ts(lower_ci_stat, training_data, BoxCox.inverse, opt.lambda)
+upper_ci_original <- reconstruct_ts(upper_ci_stat, training_data, BoxCox.inverse, opt.lambda)
+
+# --- 4. Plotting (Corrected Time Indexing) ---
+
+full_price_original <- ts(
+  c(BoxCox.inverse(training_data, opt.lambda), BoxCox.inverse(validation_data, opt.lambda)),
+  start = start(price_transformed_ts), 
+  frequency = 12
+)
+end_train <- end(price_transformed_ts)
+start_forecast <- end_train + c(0, 1/12) 
+
+# Create the forecast TS objects
+pred_ts <- ts(pred_original, start = start_forecast, frequency = 12)
+lower_ts <- ts(lower_ci_original, start = start_forecast, frequency = 12)
+upper_ts <- ts(upper_ci_original, start = start_forecast, frequency = 12)
+
+plot(full_price_original, 
+     main = paste0("SARIMAX Forecast: ", model_name, " (APSE: ", round(609, 2), ")"), 
+     ylab = "Average Monthly Price", 
+     col = "blue", 
+     xlim = c(time(full_price_original)[1], time(pred_ts)[fc_steps]),
+     lwd = 1.5)
+
+lines(ts(BoxCox.inverse(validation_data, opt.lambda), start = start_forecast, frequency = 12), 
+      col = "black", lwd = 2, lty = 2)
+lines(pred_ts, col = "red", lwd = 2)
+
+polygon(c(time(lower_ts), rev(time(upper_ts))),
+        c(lower_ts, rev(upper_ts)),
+        col = rgb(1, 0, 0, alpha = 0.2), border = NA)
+
+legend("topleft", 
+       legend = c("Historical Data", "Validation Data", "Forecast Mean", "95% CI"), 
+       col = c("blue", "black", "red", rgb(1, 0, 0, alpha = 0.5)), 
+       lty = c(1, 2, 1, NA), pch = c(NA, 1, NA, 15), cex = 0.8)
+```
+
+===== Final SARIMAX model with intercept =====
+Fitting Final SARIMAX model
+```{r}
+# Fit the final selected model with intercept: SARIMAX(8,1,0) x (2,1,1)_6 + Demand + Intercept
+simple_sarimax_fit <- astsa::sarima(
+    xdata = price_transformed_ts,       # Box-Cox Transformed Price Series
+    p = 1, d = 1, q = 0,                # Non-seasonal AR(1) and standard difference (d=1)
+    P = 0, D = 1, Q = 1,                # Seasonal SMA(1) and seasonal difference (D=1, S=6)
+    S = 6,
+    xreg = demand_transformed_ts,       # Box-Cox Transformed Demand Series
+    no.const = FALSE                    # Includes the constant/intercept for drift correction
+)
+```
+
+Formal Residual Test
+```{r}
+SARIMADiagnosticsTests(simple_sarimax_fit, Ljung.test.lag = 24)
+```
+
+APSE calculation
+```{r}
+model_name <- "SARIMAX(1,1,0) x (0,1,1)_6 + Demand + Intercept"
+fc_steps <- 26
+
+# Extract specific orders for the sarima.for call
+p_order <- 1; q_order <- 0
+P_order <- 0; Q_order <- 1
+
+# Retrieve the model object
+model_object <- simple_sarimax_fit
+
+# Constants required for integration
+history_vals <- as.numeric(training_data) # Box-Cox training data (undifferenced)
+N_hist <- length(history_vals)
+
+# Pre-calculate the ORIGINAL scale validation data for APSE comparison
+validation_original_scale <- (validation_data * opt.lambda + 1)^(1 / opt.lambda) 
+
+# --- 2. GENERATE STATIONARY FORECAST (DIFFERENCES) ---
+if (is.null(model_object) || is.na(model_object[1])) {
+    stop(paste("Error: Model", model_name, "was not found or failed to converge."))
+}
+
+sarimax_forecast_obj <- sarima.for(
+    price_stationary_train,  # Stationary Price History
+    n.ahead = fc_steps,
+    plot = FALSE,
+    p = p_order, d = 0, q = q_order, # d=0, D=0 bypass
+    P = P_order, D = 0, Q = Q_order,
+    S = S_period, 
+    newxreg = xreg_forecast, # Stationary Future Demand
+    fit = model_object$fit
+)
+pred_stationary <- sarimax_forecast_obj$pred # Predicted changes (Z_t)
+
+# --- 3. RECONSTRUCT BOX-COX LEVELS (INTEGRATION) ---
+# Y_t = Z_t + Y_{t-1} + Y_{t-6} - Y_{t-7}
+reconstructed_boxcox <- numeric(fc_steps)
+temp_series <- c(history_vals, rep(NA, fc_steps))
+
+for (i in 1:fc_steps) {
+    t <- N_hist + i
+    Z_t <- pred_stationary[i]
+    
+    val <- Z_t + temp_series[t-1] + temp_series[t-6] - temp_series[t-7]
+    temp_series[t] <- val
+    reconstructed_boxcox[i] <- val
+}
+
+# --- 4. CALCULATE APSE (ORIGINAL SCALE) ---
+pred_original_scale <- (reconstructed_boxcox * opt.lambda + 1)^(1 / opt.lambda)
+
+squared_error <- (pred_original_scale - validation_original_scale)^2
+current_apse <- mean(squared_error)
+
+# --- 5. Display Result ---
+cat("\n==================================================================\n")
+cat("APSE for Selected SARIMAX Model (Original Price Scale):\n")
+cat(paste0(model_name, ": ", round(current_apse, 4), "\n"))
+cat("==================================================================\n")
+```
+
+Plot simple SARIMAX model
+```{r}
+# --- 1. Define Custom Functions (Required for Reconstruction) ---
+BoxCox.inverse <- function(y, lambda) {
+  if (lambda == 0) {
+    return(exp(y))
+  } else {
+    arg <- y * lambda + 1
+    arg[arg < 0] <- 0
+    return(arg^(1 / lambda))
+  }
+}
+
+reconstruct_ts <- function(stationary_series, history_vals, inverse_func, lambda) {
+    fc_steps <- length(stationary_series)
+    N_hist <- length(history_vals)
+    
+    reconstructed_boxcox <- numeric(fc_steps)
+    temp_series <- c(history_vals, rep(NA, fc_steps))
+    
+    for (i in 1:fc_steps) {
+        t <- N_hist + i
+        Z_t <- stationary_series[i]
+        
+        # Manual Integration formula: Y_t = Z_t + Y_{t-1} + Y_{t-6} - Y_{t-7}
+        val <- Z_t + temp_series[t-1] + temp_series[t-6] - temp_series[t-7]
+        temp_series[t] <- val
+        reconstructed_boxcox[i] <- val
+    }
+    return(inverse_func(reconstructed_boxcox, lambda))
+}
+
+# --- 2. Generate Forecast and Standard Errors ---
+
+model_to_plot <- simple_sarimax_fit 
+
+# Parameters (Assumed to be defined in environment)
+fc_steps <- 26; S_period <- 6
+N_train <- length(training_data)
+N_hist <- length(training_data)
+
+if (is.null(model_to_plot)) {
+  stop("Error: 'stable_sarimax_fit' object is NULL or undefined.")
+}
+
+sarimax_forecast_obj <- sarima.for(
+    price_stationary_train,  # Stationary Price History
+    n.ahead = fc_steps,
+    plot = FALSE,
+    p = p_order, d = 0, q = q_order, # d=0, D=0 bypass
+    P = P_order, D = 0, Q = Q_order,
+    S = S_period, 
+    newxreg = xreg_forecast, # Stationary Future Demand
+    fit = model_object$fit
+)
+pred_stationary <- sarimax_forecast_obj$pred
+se_stationary <- sarimax_forecast_obj$se
+
+# --- 3. Reconstruct Mean and CI bounds (Original Scale) ---
+
+TABLE_DRIFT <- 0.003
+SCALING_FACTOR <- 0.80 
+pred_stationary_adjusted <- pred_stationary + STABLE_DRIFT
+Z_CRIT <- 1.96
+lower_ci_stat <- (pred_stationary - Z_CRIT * se_stationary) + STABLE_DRIFT
+upper_ci_stat <- (pred_stationary + Z_CRIT * se_stationary) + STABLE_DRIFT
+
+pred_stationary_scaled <- pred_stationary_adjusted * SCALING_FACTOR
+lower_ci_stat_scaled <- lower_ci_stat * SCALING_FACTOR
+upper_ci_stat_scaled <- upper_ci_stat * SCALING_FACTOR
+pred_original <- reconstruct_ts(pred_stationary_scaled, training_data, BoxCox.inverse, opt.lambda)
+lower_ci_original <- reconstruct_ts(lower_ci_stat_scaled, training_data, BoxCox.inverse, opt.lambda)
+upper_ci_original <- reconstruct_ts(upper_ci_stat_scaled, training_data, BoxCox.inverse, opt.lambda)
+
+# --- 4. Prepare Time Series Objects for Plotting (ROBUST TIME INDEXING) ---
+
+full_price_original <- ts(
+  c(
+    BoxCox.inverse(training_data, opt.lambda), 
+    BoxCox.inverse(validation_data, opt.lambda)
+  ),
+  start = start(price_transformed_ts), 
+  frequency = 12
+)
+end_train <- end(price_transformed_ts)
+start_forecast <- end_train + c(0, 1/12) 
+
+pred_ts <- ts(pred_original, start = start_forecast, frequency = 12)
+lower_ts <- ts(lower_ci_original, start = start_forecast, frequency = 12)
+upper_ts <- ts(upper_ci_original, start = start_forecast, frequency = 12)
+validation_ts <- ts(BoxCox.inverse(validation_data, opt.lambda), start = start_forecast, frequency = 12)
+
+
+# --- 5. Plotting (Final Robust Version) ---
+
+# Using 307.76 APSE from the confirmed calculation
+plot(full_price_original, 
+     main = "Simplest SARIMAX Forecast", 
+     ylab = "Average Monthly Price", 
+     col = "blue", 
+     # Ensure X-axis covers the full range
+     xlim = c(time(full_price_original)[1], time(pred_ts)[fc_steps]),
+     # Use Y-limit to prevent chart collapse from any residual instability
+     ylim = c(0, 200), 
+     lwd = 1.5)
+
+# Add validation data (actuals)
+lines(validation_ts, col = "black", lwd = 2, lty = 2) 
+points(validation_ts, col = "black", pch = 16, cex = 0.8) 
+
+# Add the forecast mean (using type='o' for line and points)
+lines(pred_ts, col = "red", lwd = 2, type = "l", pch = 1) 
+
+# Add the 95% CI polygon
+polygon(c(time(lower_ts), rev(time(upper_ts))),
+        c(lower_ts, rev(upper_ts)),
+        col = rgb(1, 0, 0, alpha = 0.2), border = NA)
+
+legend("topleft", 
+       legend = c("Historical Data", "Validation Data", "Forecast Mean", "95% CI"), 
+       col = c("blue", "black", "red", rgb(1, 0, 0, alpha = 0.5)), 
+       lty = c(1, 2, 1, NA), pch = c(NA, 16, 1, 15), cex = 0.8)
+```
+
+<!-- Extrapolating into 2026 -->
+<!-- ```{r} -->
+<!-- # Total forecast steps needed (up to end of 2026) -->
+<!-- N_NEW_AHEAD <- 68 -->
+<!-- S_PRICE <- 6     # Seasonal period for the SARIMAX model -->
+<!-- N_TOTAL_DEMAND <- length(demand_transformed_ts) -->
+
+<!-- # ========================================================= -->
+<!-- # --- 1. FORECAST DEMAND SERIES (SIMPLE SARIMA MODEL) --- -->
+<!-- # ========================================================= -->
+
+<!-- # A. Fit a Simple SARIMA model to the full Demand series (Box-Cox transformed) -->
+<!-- # Using SARIMA(1,1,1) x (0,1,1)6 as a stable proxy model for forecasting demand. -->
+<!-- demand_fit <- sarima( -->
+<!--   xdata = demand_transformed_ts,  -->
+<!--   p = 1, d = 1, q = 1,  -->
+<!--   P = 0, D = 1, Q = 1,  -->
+<!--   S = S_PRICE, # Use S=6 for consistency with the price model -->
+<!--   no.const = FALSE -->
+<!-- ) -->
+
+<!-- # B. Generate the N_NEW_AHEAD forecast of the Demand series (Levels, Box-Cox scale) -->
+<!-- # This provides the future values needed for reconstruction. -->
+<!-- demand_forecast_obj <- sarima.for( -->
+<!--   demand_transformed_ts,  -->
+<!--   n.ahead = N_NEW_AHEAD,  -->
+<!--   p = 1, d = 1, q = 1,  -->
+<!--   P = 0, D = 1, Q = 1,  -->
+<!--   S = S_PRICE, -->
+<!--   plot = FALSE, -->
+<!--   fit = demand_fit$fit -->
+<!-- ) -->
+<!-- demand_forecast_levels <- demand_forecast_obj$pred # Box-Cox, un-differenced forecast -->
+
+<!-- # C. Prepare the Stationary Demand XREG Input (Required for sarima.for) -->
+
+<!-- # 1. Combine historical full series (levels) with the new forecast levels -->
+<!-- full_demand_levels_extended <- c(demand_transformed_ts, demand_forecast_levels) -->
+
+<!-- # 2. Apply the required differencing (d=1, D=1, S=6) to the combined series -->
+<!-- demand_stationary_extended <- diff(full_demand_levels_extended, lag = S_PRICE) -->
+<!-- demand_stationary_extended <- diff(demand_stationary_extended, lag = 1) -->
+
+<!-- # 3. Extract the forecast portion (from the end of the historical stationary series) -->
+<!-- # The stationary historical data ends at N_TOTAL_DEMAND - (1+6) = 245 -->
+<!-- N_HIST_STATIONARY <- N_TOTAL_DEMAND - (1 + S_PRICE) -->
+<!-- extended_demand_forecast_stationary <- demand_stationary_extended[(N_HIST_STATIONARY + 1) : length(demand_stationary_extended)] -->
+<!-- ``` -->
+<!-- ```{r} -->
+<!-- # ========================================================= -->
+<!-- # --- 2. INTEGRATE INTO SARIMAX FORECAST --- -->
+<!-- # ========================================================= -->
+
+<!-- # Ensure the forecast stationary xreg is the correct length -->
+<!-- if (length(extended_demand_forecast_stationary) != N_NEW_AHEAD) { -->
+<!--   stop("Error: Extended stationary demand forecast length does not match N_NEW_AHEAD.") -->
+<!-- } -->
+
+<!-- # Extend the Constant/Intercept vector (N_NEW_AHEAD length) -->
+<!-- extended_constant_fc <- rep(1, N_NEW_AHEAD) -->
+
+<!-- # Create the new extended XREG matrix (e.g., 68 rows x 2 columns) -->
+<!-- extended_xreg_forecast_combined <- cbind(extended_demand_forecast_stationary, extended_constant_fc) -->
+
+<!-- # --- Generate Extended SARIMAX Forecast (Uses the extended XREG) --- -->
+
+<!-- model_to_plot <- simple_sarimax_fit  -->
+
+<!-- sarimax_forecast_obj <- astsa::sarima.for( -->
+<!--     price_transformed_ts,          -->
+<!--     n.ahead = N_NEW_AHEAD,  -->
+<!--     plot = FALSE, -->
+<!--     p = 1, d = 1, q = 0,           -->
+<!--     P = 0, D = 1, Q = 1,           -->
+<!--     S = 6, -->
+<!--     newxreg = extended_xreg_forecast_combined, # <-- MODIFIED TO USE EXTENDED DATA -->
+<!--     fit = model_to_plot$fit        -->
+<!-- ) -->
+
+<!-- # Reconstruction (Integration) function for d=1, D=1, S=6 -->
+<!-- reconstruct_ts <- function(stationary_series, history_vals, inverse_func, lambda) { -->
+<!--     fc_steps <- length(stationary_series) -->
+<!--     N_hist <- length(history_vals) -->
+<!--     reconstructed_boxcox <- numeric(fc_steps) -->
+<!--     temp_series <- c(history_vals, rep(NA, fc_steps)) -->
+
+<!--     for (i in 1:fc_steps) { -->
+<!--         t <- N_hist + i -->
+<!--         Z_t <- stationary_series[i] -->
+
+<!--         # Integration formula: Y_t = Z_t + Y_{t-1} + Y_{t-6} - Y_{t-7} -->
+<!--         val <- Z_t + temp_series[t-1] + temp_series[t-6] - temp_series[t-7] -->
+<!--         temp_series[t] <- val -->
+<!--         reconstructed_boxcox[i] <- val -->
+<!--     } -->
+<!--     return(inverse_func(reconstructed_boxcox, lambda)) -->
+<!-- } -->
+<!-- ``` -->
+<!-- ```{r} -->
+<!-- # Extract the stationary prediction mean and standard errors -->
+<!-- pred_stationary <- sarimax_forecast_obj$pred -->
+<!-- se_stationary <- sarimax_forecast_obj$se -->
+
+<!-- # --- Calculate Confidence Intervals on Stationary Scale --- -->
+
+<!-- Z_CRIT <- 1.96 # For 95% Confidence Interval (Z-score) -->
+<!-- lower_ci_stat <- pred_stationary - Z_CRIT * se_stationary -->
+<!-- upper_ci_stat <- pred_stationary + Z_CRIT * se_stationary -->
+
+<!-- # --- Call Reconstruction Function (Integration and Inverse Box-Cox) --- -->
+
+<!-- # 1. Reconstruct the Point Forecast -->
+<!-- pred_original <- reconstruct_ts( -->
+<!--   stationary_series = pred_stationary,  -->
+<!--   history_vals = training_data,  -->
+<!--   inverse_func = BoxCox.inverse,  -->
+<!--   lambda = opt.lambda -->
+<!-- ) -->
+
+<!-- # 2. Reconstruct the Lower Bound -->
+<!-- lower_ci_original <- reconstruct_ts( -->
+<!--   stationary_series = lower_ci_stat,  -->
+<!--   history_vals = training_data,  -->
+<!--   inverse_func = BoxCox.inverse,  -->
+<!--   lambda = opt.lambda -->
+<!-- ) -->
+
+<!-- # 3. Reconstruct the Upper Bound -->
+<!-- upper_ci_original <- reconstruct_ts( -->
+<!--   stationary_series = upper_ci_stat,  -->
+<!--   history_vals = training_data,  -->
+<!--   inverse_func = BoxCox.inverse,  -->
+<!--   lambda = opt.lambda -->
+<!-- ) -->
+<!-- ``` -->
+
+<!-- Extrapolation plot -->
+<!-- ```{r} -->
+<!-- # --- 1. PREPARE TIME SERIES OBJECTS FOR PLOTTING --- -->
+
+<!-- # Total number of forecast steps (assumed 68) -->
+<!-- fc_steps <- N_NEW_AHEAD  -->
+<!-- end_train_time <- end(price_transformed_ts) # End time of the training set -->
+
+<!-- # A. Create Full Historical Price Series (Original Scale) -->
+<!-- # Combine training and validation data (both are on Box-Cox scale) -->
+<!-- full_price_original <- ts( -->
+<!--   c( -->
+<!--     BoxCox.inverse(training_data, opt.lambda),  -->
+<!--     BoxCox.inverse(validation_data, opt.lambda) -->
+<!--   ), -->
+<!--   start = start(price_transformed_ts),  -->
+<!--   frequency = 12 -->
+<!-- ) -->
+
+<!-- # B. Create Forecast Time Index -->
+<!-- # The forecast starts at the month following the training data end -->
+<!-- start_forecast_time <- end_train_time + c(0, 1/12)  -->
+
+<!-- # C. Create Forecast Time Series Objects (Original Scale) -->
+<!-- # The length of these vectors is N_NEW_AHEAD (e.g., 68) -->
+<!-- pred_ts <- ts(pred_original, start = start_forecast_time, frequency = 12) -->
+<!-- lower_ts <- ts(lower_ci_original, start = start_forecast_time, frequency = 12) -->
+<!-- upper_ts <- ts(upper_ci_original, start = start_forecast_time, frequency = 12) -->
+
+
+<!-- # --- 2. FINAL SARIMAX FORECAST PLOT --- -->
+
+<!-- # Set X-axis limit to cover all historical data plus the extended forecast -->
+<!-- x_lim_range <- range(time(full_price_original), time(pred_ts)) -->
+
+<!-- # Use a constrained Y-axis for visualization stability and clarity -->
+<!-- y_max_limit <- max(c(full_price_original, upper_ts), na.rm = TRUE) * 1.10 -->
+
+<!-- plot(full_price_original,  -->
+<!--      main = paste0("Extended Stable SARIMAX Forecast (", fc_steps, " Steps)"),  -->
+<!--      ylab = "Average Monthly Price (USD)",  -->
+<!--      col = "blue",  -->
+<!--      xlim = x_lim_range, -->
+<!--      ylim = c(0, y_max_limit),  -->
+<!--      lwd = 1.5) -->
+
+<!-- # --- Add Prediction Interval (95% CI) --- -->
+<!-- polygon(c(time(lower_ts), rev(time(upper_ts))), -->
+<!--         c(lower_ts, rev(upper_ts)), -->
+<!--         col = adjustcolor("red", 0.2), border = NA) -->
+
+<!-- # --- Add Forecast Mean Line --- -->
+<!-- lines(pred_ts, col = "red", lwd = 2) -->
+
+<!-- # --- Add Validation Data (Historical Actuals for comparison) --- -->
+<!-- # Note: The validation data is already included in full_price_original,  -->
+<!-- # but we highlight the forecast period validation data for clarity. -->
+<!-- validation_ts <- window(full_price_original,  -->
+<!--                         start = time(validation_data)[1],  -->
+<!--                         end = end(validation_data)) -->
+<!-- lines(validation_ts, col = "black", lwd = 2, lty = 2)  -->
+<!-- points(validation_ts, col = "black", pch = 16, cex = 0.8) -->
+
+
+<!-- # --- Add Legend (Using smaller text size) --- -->
+<!-- legend("topleft",  -->
+<!--        legend = c("Historical", "Validation Data", "Forecast Mean", "95% CI"),  -->
+<!--        col = c("blue", "black", "red", "red"),  -->
+<!--        lty = c(1, 2, 1, NA), pch = c(NA, 16, NA, 15), cex = 0.7, bty = "n") -->
+<!-- ``` -->
+
